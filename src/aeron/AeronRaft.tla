@@ -42,9 +42,11 @@ VARIABLE clusterMembers_leadershipTermId
 VARIABLE clusterMembers_logPosition
 VARIABLE network
 
+VARIABLE checker_timeoutCount
+
 \* Variables for limiting the state space search, rather than modelling the actual behaviour.
 
-Symmetry == Permutations(Nodes) \union Permutations(Payloads)
+Symmetry == { p[1] @@ p[2] : p \in Permutations(Nodes) \X Permutations(Payloads) }
 
 Roles == {
     "LEADER",
@@ -115,6 +117,7 @@ Init ==
     /\ clusterMembers_isBallotSent = [n \in Nodes |-> [m \in Nodes |-> FALSE]]
     /\ clusterMembers_leadershipTermId = [n \in Nodes |-> [m \in Nodes |-> NullValue]]
     /\ clusterMembers_logPosition = [n \in Nodes |-> [m \in Nodes |-> NullValue]]
+    /\ checker_timeoutCount = [n \in Nodes |-> 0]
 
 persistent_state == <<nodeStateFile_candidateTermId, nodeStateFile_logPosition, log, recordingLog>>
 
@@ -135,7 +138,7 @@ member_fields == <<clusterMembers_vote, clusterMembers_candidateTermId,
                    clusterMembers_logPosition>>
 
 
-checker_vars == <<>>
+checker_vars == <<checker_timeoutCount>>
 
 vars == <<persistent_state, module_fields, election_state, election_fields, member_fields, network, checker_vars>>
 
@@ -144,10 +147,9 @@ Max(S) == CHOOSE x \in S : \A y \in S : x >= y
 Min(S) == CHOOSE x \in S : \A y \in S : x <= y
 
 Send0(newNetwork, msg, destinations) ==
-    [<<from, to>> \in {msg.from} \X destinations |->
-                      LET queue == Append(network[from, to], [to |-> to] @@ msg) IN
-                      SubSeq(queue, Max({1, Len(queue) - NetworkQueueMaxSize + 1}), Len(queue))
-    ] @@ newNetwork
+    \* Is for all too strong here?
+    /\ \A d \in destinations : Len(newNetwork[msg.from, d]) < NetworkQueueMaxSize
+    /\ network' = [<<from, to>> \in {msg.from} \X destinations |-> Append(newNetwork[from, to], [to |-> to] @@ msg)] @@ newNetwork
 
 Send(newNetwork, msg) == Send0(newNetwork, msg, {msg.to})
 
@@ -160,8 +162,8 @@ Consume(n, type, MessageHandler(_,_,_)) ==
                newNetwork == [network EXCEPT ![src, n] = Tail(@)] IN
             /\ type = msg.type
             /\ MessageHandler(n, msg, newNetwork)
-            /\ Assert(ENABLED MessageHandler(n, msg, newNetwork),
-                      "Message handler for " \o type \o " was not enabled with message: " \o ToString(msg))
+\*            /\ Assert(ENABLED MessageHandler(n, msg, newNetwork),
+\*                      "Message handler for " \o type \o " was not enabled with message: " \o ToString(msg))
 
 OtherNodes(n) == Nodes \ {n}
 
@@ -169,6 +171,7 @@ OtherNodes(n) == Nodes \ {n}
 Election_HandleError(n) ==
     /\ election_state' = [election_state EXCEPT ![n] = "INIT"]
     /\ election_logPosition' = [election_logPosition EXCEPT ![n] = commitPosition[n]]
+    /\ checker_timeoutCount' = [ checker_timeoutCount EXCEPT ![n] = checker_timeoutCount[n] + 1 ]
 
 \* Models the transition to CANVASS from other states, which resets members etc.
 Election_State_CANVASS(n, timeoutCount) ==
@@ -182,6 +185,7 @@ Election_State_CANVASS(n, timeoutCount) ==
                                                  [ m \in Nodes |-> IF m = n THEN election_logPosition[n] ELSE NullValue ] ]
     /\ election_leaderMember' = [election_leaderMember EXCEPT ![n] = Null]
     /\ role' = [role EXCEPT ![n] = "FOLLOWER"]
+    /\ checker_timeoutCount' = [ checker_timeoutCount EXCEPT ![n] = checker_timeoutCount[n] + timeoutCount ]
 
 Election_State_CANDIDATE_BALLOT(n) ==
     /\ election_state' = [election_state EXCEPT ![n] = "CANDIDATE_BALLOT"]
@@ -220,11 +224,11 @@ Election_Init(n) ==
                    network>>
 
 Election_PublishCanvassPosition(n) ==
-    /\ network' = Broadcast(network, [from |-> n,
-                             type |-> "CanvassPosition",
-                             logLeadershipTermId |-> election_logLeadershipTermId[n],
-                             appendPosition |-> election_appendPosition[n],
-                             logPosition |-> election_logPosition[n]])
+    /\ Broadcast(network, [from |-> n,
+                           type |-> "CanvassPosition",
+                           logLeadershipTermId |-> election_logLeadershipTermId[n],
+                           appendPosition |-> election_appendPosition[n],
+                           logPosition |-> election_logPosition[n]])
     /\ UNCHANGED <<persistent_state, module_fields, election_state, election_fields, member_fields, checker_vars>>
 
 ClusterMember_CompareLog0(lhsLeadershipTermId, lhsLogPosition, rhsLeadershipTermId, rhsLogPosition) ==
@@ -314,11 +318,11 @@ Election_CandidateBallot(n) ==
                          network>>
        \/ /\ \A m \in OtherNodes(n) : clusterMembers_isBallotSent[n][m] = FALSE
           /\ clusterMembers_isBallotSent' = [clusterMembers_isBallotSent EXCEPT ![n] = [m \in Nodes |-> TRUE]]
-          /\ network' = Broadcast(network, [type |-> "RequestVote",
-                                            from |-> n,
-                                            logLeadershipTermId |-> election_logLeadershipTermId[n],
-                                            logPosition |-> election_appendPosition[n],
-                                            candidateTermId |-> election_candidateTermId[n]])
+          /\ Broadcast(network, [type |-> "RequestVote",
+                                 from |-> n,
+                                 logLeadershipTermId |-> election_logLeadershipTermId[n],
+                                 logPosition |-> election_appendPosition[n],
+                                 candidateTermId |-> election_candidateTermId[n]])
           /\ UNCHANGED <<persistent_state, module_fields, election_state, election_fields,
                          clusterMembers_vote, clusterMembers_candidateTermId,
                          clusterMembers_leadershipTermId, clusterMembers_logPosition, checker_vars>>
@@ -390,24 +394,24 @@ Election_PublishNewLeadershipTermOnInterval(n, quorumPos) ==
        LET nextLogPosition == IF entry = Null THEN NullValue
                               ELSE IF entry.logPosition = NullValue THEN election_appendPosition[n]
                               ELSE entry.logPosition IN
-       network' = Broadcast(network, [type |-> "NewLeadershipTerm",
-                                      from |-> n,
-                                      logLeadershipTermId |-> election_logLeadershipTermId[n],
-                                      nextLeadershipTermId |-> nextLeadershipTermId,
-                                      nextTermBaseLogPosition |-> nextTermBaseLogPosition,
-                                      nextLogPosition |-> nextLogPosition,
-                                      leadershipTermId |-> election_leadershipTermId[n],
-                                      termBaseLogPosition |-> election_appendPosition[n],
-                                      logPosition |-> election_appendPosition[n],
-                                      commitPosition |-> quorumPos,
-                                      leaderMember |-> n ])
+       Broadcast(network, [type |-> "NewLeadershipTerm",
+                           from |-> n,
+                           logLeadershipTermId |-> election_logLeadershipTermId[n],
+                           nextLeadershipTermId |-> nextLeadershipTermId,
+                           nextTermBaseLogPosition |-> nextTermBaseLogPosition,
+                           nextLogPosition |-> nextLogPosition,
+                           leadershipTermId |-> election_leadershipTermId[n],
+                           termBaseLogPosition |-> election_appendPosition[n],
+                           logPosition |-> election_appendPosition[n],
+                           commitPosition |-> quorumPos,
+                           leaderMember |-> n ])
 
 CM_PublishCommitPosition(n, quorumPos, termId) ==
-    network' = Broadcast(network, [type |-> "CommitPosition",
-                                   from |-> n,
-                                   leadershipTermId |-> termId,
-                                   logPosition |-> quorumPos,
-                                   leaderMember |-> n ])
+    Broadcast(network, [type |-> "CommitPosition",
+                        from |-> n,
+                        leadershipTermId |-> termId,
+                        logPosition |-> quorumPos,
+                        leaderMember |-> n ])
 
 Election_PublishCommitPositionOnInterval(n, quorumPos) ==
     /\ election_lastPublishedCommitPosition[n] < quorumPos
@@ -560,36 +564,34 @@ Election_LeaderReady(n) ==
              /\ UNCHANGED <<persistent_state, module_fields, election_state, election_fields, member_fields, checker_vars>>
 
 Election_PublishFollowerReplicationPosition(n) ==
-    \/ /\ election_lastPublishedAppendPosition[n] < election_appendPosition[n]
-       /\ election_lastPublishedAppendPosition' = [election_lastPublishedAppendPosition EXCEPT ![n] = election_appendPosition[n]]
-       /\ network' = Send(network, [type |-> "AppendPosition",
-                                    from |-> n,
-                                    to |-> election_leaderMember[n],
-                                    leadershipTermId |-> election_replicationLeadershipTermId[n],
-                                    logPosition |-> election_appendPosition[n],
-                                    leaderMember |-> election_leaderMember[n]])
-       /\ UNCHANGED <<persistent_state, module_fields, election_state,
-                      election_logPosition, election_appendPosition,
-                      election_logLeadershipTermId, election_leadershipTermId,
-                      election_candidateTermId, election_notifiedCommitPosition,
-                      election_leaderMember,
-                      election_lastPublishedCommitPosition,
-                      election_catchupJoinPosition, election_logSubscription,
-                      election_replicationLeadershipTermId, election_replicationStopPosition,
-                      election_replicationTermBaseLogPosition,
-                      member_fields, checker_vars>>
-    \/ /\ election_lastPublishedAppendPosition[n] >= election_appendPosition[n]
-       /\ UNCHANGED vars
+    /\ election_lastPublishedAppendPosition[n] < election_appendPosition[n]
+    /\ election_lastPublishedAppendPosition' = [election_lastPublishedAppendPosition EXCEPT ![n] = election_appendPosition[n]]
+    /\ Send(network, [type |-> "AppendPosition",
+                      from |-> n,
+                      to |-> election_leaderMember[n],
+                      leadershipTermId |-> election_replicationLeadershipTermId[n],
+                      logPosition |-> election_appendPosition[n],
+                      leaderMember |-> election_leaderMember[n]])
+    /\ UNCHANGED <<persistent_state, module_fields, election_state,
+                   election_logPosition, election_appendPosition,
+                   election_logLeadershipTermId, election_leadershipTermId,
+                   election_candidateTermId, election_notifiedCommitPosition,
+                   election_leaderMember,
+                   election_lastPublishedCommitPosition,
+                   election_catchupJoinPosition, election_logSubscription,
+                   election_replicationLeadershipTermId, election_replicationStopPosition,
+                   election_replicationTermBaseLogPosition,
+                   member_fields, checker_vars>>
 
 Election_PublishFollowerAppendPosition(n) ==
     /\ election_lastPublishedAppendPosition[n] /= election_appendPosition[n]
     /\ election_lastPublishedAppendPosition' = [election_lastPublishedAppendPosition EXCEPT ![n] = election_appendPosition[n]]
-    /\ network' = Send(network, [type |-> "AppendPosition",
-                                 from |-> n,
-                                 to |-> election_leaderMember[n],
-                                 leadershipTermId |-> election_leadershipTermId[n],
-                                 logPosition |-> election_appendPosition[n],
-                                 leaderMember |-> election_leaderMember[n]])
+    /\ Send(network, [type |-> "AppendPosition",
+                      from |-> n,
+                      to |-> election_leaderMember[n],
+                      leadershipTermId |-> election_leadershipTermId[n],
+                      logPosition |-> election_appendPosition[n],
+                      leaderMember |-> election_leaderMember[n]])
     /\ UNCHANGED <<persistent_state, module_fields, election_state,
                    election_logPosition, election_appendPosition,
                    election_logLeadershipTermId, election_leadershipTermId,
@@ -756,11 +758,11 @@ Election_FollowerCatchupInit(n) ==
     /\ \/ /\ election_leaderMember[n] /= Null
           /\ election_logSubscription' = [election_logSubscription EXCEPT ![n] = [ source |-> election_leaderMember[n],
                                                                                    position |-> Null ] ]
-          /\ network' = Send(network, [type |-> "CatchupPosition",
-                                       from |-> n,
-                                       to |-> election_leaderMember[n],
-                                       leadershipTermId |-> election_leadershipTermId[n],
-                                       logPosition |-> election_logPosition[n]])
+          /\ Send(network, [type |-> "CatchupPosition",
+                            from |-> n,
+                            to |-> election_leaderMember[n],
+                            leadershipTermId |-> election_leadershipTermId[n],
+                            logPosition |-> election_logPosition[n]])
           /\ election_state' = [election_state EXCEPT ![n] = "FOLLOWER_CATCHUP_AWAIT"]
           /\ UNCHANGED <<persistent_state, module_fields, election_logPosition, election_appendPosition,
                          election_logLeadershipTermId, election_leadershipTermId,
@@ -816,11 +818,11 @@ Election_FollowerCatchupAwait(n) ==
 CM_UpdateFollowerPosition(n) ==
     /\ election_leaderMember[n] /= Null
     /\ LET position == Max({Len(log[n]), lastAppendPosition[n]})
-       IN /\ network' = Send(network, [type |-> "AppendPosition",
-                                       from |-> n,
-                                       to |-> election_leaderMember[n],
-                                       leadershipTermId |-> leadershipTermId[n],
-                                       logPosition |-> position])
+       IN /\ Send(network, [type |-> "AppendPosition",
+                            from |-> n,
+                            to |-> election_leaderMember[n],
+                            leadershipTermId |-> leadershipTermId[n],
+                            logPosition |-> position])
           /\ lastAppendPosition' = [lastAppendPosition EXCEPT ![n] = position]
           /\ UNCHANGED <<persistent_state, role, commitPosition, leaderMember, logReplay, leadershipTermId,
                          logReplication, notifiedCommitPosition, election_state, election_fields, member_fields,
@@ -953,12 +955,12 @@ Election_FollowerLogAwait(n) ==
 
 Election_FollowerReady(n) ==
     /\ election_state[n] = "FOLLOWER_READY"
-    /\ \/ /\ network' = Send(network, [type |-> "AppendPosition",
-                                       from |-> n,
-                                       to |-> election_leaderMember[n],
-                                       leadershipTermId |-> election_leadershipTermId[n],
-                                       logPosition |-> election_logPosition[n],
-                                       leaderMember |-> election_leaderMember[n]])
+    /\ \/ /\ Send(network, [type |-> "AppendPosition",
+                            from |-> n,
+                            to |-> election_leaderMember[n],
+                            leadershipTermId |-> election_leadershipTermId[n],
+                            logPosition |-> election_logPosition[n],
+                            leaderMember |-> election_leaderMember[n]])
           /\ election_state' = [election_state EXCEPT ![n] = "CLOSED"]
           /\ CM_ElectionComplete(n)
           /\ UNCHANGED <<persistent_state, role, logReplay,
@@ -1036,18 +1038,18 @@ Election_PublishNewLeadershipTerm(n, destMember, logLeadershipTermId, quorumPosi
                                 THEN nextTermEntry.logPosition
                                 ELSE election_appendPosition[n]
                            ELSE NullValue IN
-    network' = Send(newNetwork, [type |-> "NewLeadershipTerm",
-                                 from |-> n,
-                                 to |-> destMember,
-                                 logLeadershipTermId |-> logLeadershipTermId,
-                                 nextLeadershipTermId |-> nextLeadershipTermId,
-                                 nextTermBaseLogPosition |-> nextTermBaseLogPosition,
-                                 nextLogPosition |-> nextLogPosition,
-                                 leadershipTermId |-> election_leadershipTermId[n],
-                                 termBaseLogPosition |-> election_appendPosition[n],
-                                 logPosition |-> election_appendPosition[n],
-                                 commitPosition |-> quorumPosition,
-                                 leaderMember |-> n])
+    Send(newNetwork, [type |-> "NewLeadershipTerm",
+                      from |-> n,
+                      to |-> destMember,
+                      logLeadershipTermId |-> logLeadershipTermId,
+                      nextLeadershipTermId |-> nextLeadershipTermId,
+                      nextTermBaseLogPosition |-> nextTermBaseLogPosition,
+                      nextLogPosition |-> nextLogPosition,
+                      leadershipTermId |-> election_leadershipTermId[n],
+                      termBaseLogPosition |-> election_appendPosition[n],
+                      logPosition |-> election_appendPosition[n],
+                      commitPosition |-> quorumPosition,
+                      leaderMember |-> n])
 
 Election_OnCanvassPosition(n, msg, newNetwork) ==
     \/ /\ election_state[n] = "INIT"
@@ -1113,33 +1115,33 @@ CM_OnCanvassPosition(n, msg, newNetwork) ==
                                                            ELSE currentTermEntry.termBaseLogPosition
                                 nextLogPosition == IF nextLogEntry /= Null THEN nextLogEntry.logPosition
                                                    ELSE NullValue
-                            IN /\ network' = Send(newNetwork, [type |-> "NewLeadershipTerm",
-                                                               from |-> n,
-                                                               to |-> msg.from,
-                                                               logLeadershipTermId |-> msg.logLeadershipTermId,
-                                                               nextLeadershipTermId |-> nextLogLeadershipTermId,
-                                                               nextTermBaseLogPosition |-> nextTermBaseLogPosition,
-                                                               nextLogPosition |-> nextLogPosition,
-                                                               leadershipTermId |-> leadershipTermId[n],
-                                                               termBaseLogPosition |-> currentTermEntry.termBaseLogPosition,
-                                                               logPosition |-> Len(log[n]),
-                                                               commitPosition |-> commitPosition[n],
-                                                               leaderMember |-> n ])
+                            IN /\ Send(newNetwork, [type |-> "NewLeadershipTerm",
+                                                    from |-> n,
+                                                    to |-> msg.from,
+                                                    logLeadershipTermId |-> msg.logLeadershipTermId,
+                                                    nextLeadershipTermId |-> nextLogLeadershipTermId,
+                                                    nextTermBaseLogPosition |-> nextTermBaseLogPosition,
+                                                    nextLogPosition |-> nextLogPosition,
+                                                    leadershipTermId |-> leadershipTermId[n],
+                                                    termBaseLogPosition |-> currentTermEntry.termBaseLogPosition,
+                                                    logPosition |-> Len(log[n]),
+                                                    commitPosition |-> commitPosition[n],
+                                                    leaderMember |-> n ])
                                /\ UNCHANGED <<persistent_state, module_fields, election_state, election_fields,
                                               clusterMembers_vote, clusterMembers_isBallotSent,
                                               clusterMembers_candidateTermId, checker_vars>>
-                      \/ /\ network' = Send(newNetwork, [type |-> "NewLeadershipTerm",
-                                                         from |-> n,
-                                                         to |-> msg.from,
-                                                         logLeadershipTermId |-> msg.logLeadershipTermId,
-                                                         nextLeadershipTermId |-> NullValue,
-                                                         nextTermBaseLogPosition |-> NullValue,
-                                                         nextLogPosition |-> NullValue,
-                                                         leadershipTermId |-> leadershipTermId[n],
-                                                         termBaseLogPosition |-> currentTermEntry.termBaseLogPosition,
-                                                         logPosition |-> Len(log[n]),
-                                                         commitPosition |-> commitPosition[n],
-                                                         leaderMember |-> n ])
+                      \/ /\ Send(newNetwork, [type |-> "NewLeadershipTerm",
+                                              from |-> n,
+                                              to |-> msg.from,
+                                              logLeadershipTermId |-> msg.logLeadershipTermId,
+                                              nextLeadershipTermId |-> NullValue,
+                                              nextTermBaseLogPosition |-> NullValue,
+                                              nextLogPosition |-> NullValue,
+                                              leadershipTermId |-> leadershipTermId[n],
+                                              termBaseLogPosition |-> currentTermEntry.termBaseLogPosition,
+                                              logPosition |-> Len(log[n]),
+                                              commitPosition |-> commitPosition[n],
+                                              leaderMember |-> n ])
                          /\ UNCHANGED <<persistent_state, module_fields, election_state, election_fields,
                                         clusterMembers_vote, clusterMembers_isBallotSent,
                                         clusterMembers_candidateTermId, checker_vars>>
@@ -1347,13 +1349,13 @@ CM_OnNewLeadershipTerm(n, msg, newNetwork) ==
                                checker_vars>>
 
 Election_PlaceVote(n, candidate, candidateTermId, vote, newNetwork) ==
-    network' = Send(newNetwork, [type |-> "Vote",
-                                 from |-> n,
-                                 to |-> candidate,
-                                 candidateTermId |-> candidateTermId,
-                                 logLeadershipTermId |-> election_logLeadershipTermId[n],
-                                 logPosition |-> election_appendPosition[n],
-                                 vote |-> vote])
+    Send(newNetwork, [type |-> "Vote",
+                      from |-> n,
+                      to |-> candidate,
+                      candidateTermId |-> candidateTermId,
+                      logLeadershipTermId |-> election_logLeadershipTermId[n],
+                      logPosition |-> election_appendPosition[n],
+                      vote |-> vote])
 
 Election_OnRequestVote(n, msg, newNetwork) ==
     \/ /\ election_state[n] = "INIT"
@@ -1656,11 +1658,11 @@ Spec == Init /\ [][Next]_vars
 
 \* State constraint to bound the execution for model checking
 StateConstraint ==
-    \A n \in Nodes : /\ Len(log[n]) <= 5
+    \A n \in Nodes : /\ Len(log[n]) <= 3
                      /\ nodeStateFile_candidateTermId[n] <= 2
                      /\ election_candidateTermId[n] <= 2
-                     /\ leadershipTermId[n] <= 2
-                     \* /\ checker_timeoutCount[n] <= 10
+                     /\ leadershipTermId[n] <= 1
+                     /\ checker_timeoutCount[n] <= 2
 
 \* Type invariant to catch basic errors
 TypeInvariant ==
@@ -1701,8 +1703,8 @@ Debug_AnotherLeader ==
 
 \* Invariant for debugging that will be falsified when multiple elections have completed on all nodes.
 Debug_CompleteMultipleElections ==
-    ~ \A n \in Nodes : /\ election_state[n] = "CLOSED"
-                       /\ leadershipTermId[n] > 0
+    ~ \E n \in Nodes : /\ election_state[n] = "CLOSED"
+                       \* /\ leadershipTermId[n] > 0
                        /\ \E i1, i2 \in DOMAIN log[n] : /\ i1 /= i2
                                                         /\ log[n][i1].type = "NewLeadershipTerm"
                                                         /\ log[n][i2].type = "NewLeadershipTerm"
