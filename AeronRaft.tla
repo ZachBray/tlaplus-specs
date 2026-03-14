@@ -119,8 +119,10 @@ Init ==
 
 persistent_state == <<nodeStateFile_candidateTermId, nodeStateFile_logPosition, log, recordingLog>>
 
-module_fields == <<role, commitPosition, leaderMember, logReplay, leadershipTermId, logReplication, lastAppendPosition,
-                   notifiedCommitPosition>>
+non_replication_module_fields == <<role, commitPosition, leaderMember, leadershipTermId, lastAppendPosition,
+                                   notifiedCommitPosition>>
+
+module_fields == <<non_replication_module_fields, logReplay, logReplication>>
 
 election_fields == <<election_logPosition, election_appendPosition,
                      election_logLeadershipTermId, election_leadershipTermId,
@@ -164,17 +166,20 @@ Consume(n, type, MessageHandler(_,_,_)) ==
 
 OtherNodes(n) == Nodes \ {n}
 
-\* This isn't in the Java code, but it avoids increasing the state space with irrelevant values for these fields
-\* when not replicating, and I don't think there are bugs here, so there is little point in searching
-\* this part of the space.
-ClearReplicationFields(n) ==
+\* This isn't in the Java code, but it avoids increasing the state space with what I think are irrelevant values
+\* for these fields at certain transition points, e.g., transitioning back to INIT after an error or to CANVASS.
+ResetUnusedFields(n) ==
     /\ election_replicationStopPosition' = [election_replicationStopPosition EXCEPT ![n] = NullValue]
     /\ election_replicationLeadershipTermId' = [election_replicationLeadershipTermId EXCEPT ![n] = NullValue]
     /\ election_replicationTermBaseLogPosition' = [election_replicationTermBaseLogPosition EXCEPT ![n] = NullValue]
+    /\ election_logSubscription' = [election_logSubscription EXCEPT ![n] = Null]
+    /\ election_catchupJoinPosition' = [election_catchupJoinPosition EXCEPT ![n] = NullValue]
+    /\ logReplication' = [logReplication EXCEPT ![n] = Null]
+    /\ logReplay' = [logReplay EXCEPT ![n] = Null]
 
 \* Models the handling of exceptions thrown by Election#doWork
 Election_HandleError(n) ==
-    /\ ClearReplicationFields(n)
+    /\ ResetUnusedFields(n)
     /\ election_state' = [election_state EXCEPT ![n] = "INIT"]
     /\ election_logPosition' = [election_logPosition EXCEPT ![n] = commitPosition[n]]
     /\ checker_timeoutCount' = [ checker_timeoutCount EXCEPT ![n] = checker_timeoutCount[n] + 1 ]
@@ -191,7 +196,7 @@ Election_State_CANVASS(n, timeoutCount) ==
                                                  [ m \in Nodes |-> IF m = n THEN election_logPosition[n] ELSE NullValue ] ]
     /\ election_leaderMember' = [election_leaderMember EXCEPT ![n] = Null]
     /\ role' = [role EXCEPT ![n] = "FOLLOWER"]
-    /\ ClearReplicationFields(n)
+    /\ ResetUnusedFields(n)
     /\ checker_timeoutCount' = [ checker_timeoutCount EXCEPT ![n] = checker_timeoutCount[n] + timeoutCount ]
 
 Election_State_CANDIDATE_BALLOT(n) ==
@@ -215,10 +220,6 @@ Election_Init(n) ==
     /\ Election_State_CANVASS(n, 0)
     /\ election_candidateTermId' = [election_candidateTermId EXCEPT ![n] = Max({nodeStateFile_candidateTermId[n], election_leadershipTermId[n]})]
     /\ election_notifiedCommitPosition' = [election_notifiedCommitPosition EXCEPT ![n] = 0]
-    /\ election_catchupJoinPosition' = [election_catchupJoinPosition EXCEPT ![n] = NullValue]
-    /\ logReplication' = [logReplication EXCEPT ![n] = Null]
-    /\ logReplay' = [logReplay EXCEPT ![n] = Null]
-    /\ election_logSubscription' = [election_logSubscription EXCEPT ![n] = Null]
     /\ election_appendPosition' = [election_appendPosition EXCEPT ![n] = Len(log[n])]
     /\ lastAppendPosition' = [lastAppendPosition EXCEPT ![n] = Len(log[n])]
     /\ commitPosition' = [commitPosition EXCEPT ![n] = election_logPosition[n]]
@@ -306,11 +307,11 @@ Election_CandidateBallot(n) ==
                          election_replicationTermBaseLogPosition,
                          member_fields, network, checker_vars>>
        \/ /\ Election_State_CANVASS(n, 1)
-          /\ UNCHANGED <<persistent_state, commitPosition, leaderMember, logReplay, leadershipTermId,
-                         logReplication, lastAppendPosition, notifiedCommitPosition,
+          /\ UNCHANGED <<persistent_state, commitPosition, leaderMember, leadershipTermId,
+                         lastAppendPosition, notifiedCommitPosition,
                          election_logPosition, election_appendPosition, election_logLeadershipTermId,
                          election_leadershipTermId, election_candidateTermId, election_notifiedCommitPosition,
-                         election_catchupJoinPosition, election_logSubscription, network>>
+                         network>>
        \/ /\ \A m \in OtherNodes(n) : clusterMembers_isBallotSent[n][m] = FALSE
           /\ clusterMembers_isBallotSent' = [clusterMembers_isBallotSent EXCEPT ![n] = [m \in Nodes |-> TRUE]]
           /\ Broadcast(network, [type |-> "RequestVote",
@@ -325,11 +326,10 @@ Election_CandidateBallot(n) ==
 Election_FollowerBallot(n) ==
     /\ election_state[n] = "FOLLOWER_BALLOT"
     /\ Election_State_CANVASS(n, 1)
-    /\ UNCHANGED <<persistent_state, commitPosition, leaderMember, logReplay, leadershipTermId,
-                   logReplication, lastAppendPosition, notifiedCommitPosition,
+    /\ UNCHANGED <<persistent_state, commitPosition, leaderMember, leadershipTermId,
+                   lastAppendPosition, notifiedCommitPosition,
                    election_logPosition, election_appendPosition, election_logLeadershipTermId,
-                   election_leadershipTermId, election_candidateTermId, election_notifiedCommitPosition,
-                   election_catchupJoinPosition, election_logSubscription, network>>
+                   election_leadershipTermId, election_candidateTermId, election_notifiedCommitPosition, network>>
 
 QuorumPosition(n, q) == Min({ clusterMembers_logPosition[n][m] : m \in q })
 MaxQuorumPosition(n) == Max({ QuorumPosition(n, q) : q \in Quorums })
@@ -590,25 +590,23 @@ Election_FollowerLogReplication(n) ==
                        stopPosition |-> election_replicationStopPosition[n],
                        sourceMember |-> election_leaderMember[n]
                    ]]
-                /\ ClearReplicationFields(n)
                 /\ UNCHANGED <<persistent_state, role, commitPosition, leaderMember, logReplay,
                                leadershipTermId, lastAppendPosition, notifiedCommitPosition, election_state,
                                election_logPosition, election_appendPosition,
                                election_logLeadershipTermId, election_leadershipTermId,
-                               election_candidateTermId, election_notifiedCommitPosition,
-                               election_leaderMember,
+                               election_candidateTermId, election_notifiedCommitPosition, election_leaderMember,
                                election_catchupJoinPosition, election_logSubscription,
+                               election_replicationStopPosition, election_replicationLeadershipTermId, election_replicationTermBaseLogPosition,
                                member_fields, network, checker_vars>>
              \/ /\ election_appendPosition[n] >= election_replicationStopPosition[n]
                 /\ RecordingLog_EnsureCoherent(n, election_replicationLeadershipTermId[n], election_replicationTermBaseLogPosition[n], election_replicationStopPosition[n])
                 /\ election_logLeadershipTermId' = [election_logLeadershipTermId EXCEPT ![n] = election_replicationLeadershipTermId[n]]
                 /\ Election_State_CANVASS(n, 0)
                 /\ UNCHANGED <<nodeStateFile_candidateTermId, nodeStateFile_logPosition, log,
-                               commitPosition, leaderMember, logReplay, leadershipTermId,
-                               logReplication, lastAppendPosition, notifiedCommitPosition,
+                               commitPosition, leaderMember, leadershipTermId,
+                               lastAppendPosition, notifiedCommitPosition,
                                election_logPosition, election_appendPosition, election_leadershipTermId,
-                               election_candidateTermId, election_notifiedCommitPosition,
-                               election_catchupJoinPosition, election_logSubscription, network>>
+                               election_candidateTermId, election_notifiedCommitPosition, network>>
        \/ /\ logReplication[n] /= Null
           /\ ~LogReplication_IsDone(logReplication[n])
           /\ LET newPosition == logReplication[n].position + 1
@@ -624,29 +622,24 @@ Election_FollowerLogReplication(n) ==
        \/ /\ LogReplication_IsDone(logReplication[n])
           /\ election_notifiedCommitPosition[n] >= election_appendPosition[n]
           /\ election_appendPosition' = [election_appendPosition EXCEPT ![n] = logReplication[n].position]
-          /\ logReplication' = [logReplication EXCEPT ![n] = Null]
           /\ RecordingLog_EnsureCoherent(n, election_replicationLeadershipTermId[n], election_replicationTermBaseLogPosition[n], election_replicationStopPosition[n])
           /\ election_logLeadershipTermId' = [election_logLeadershipTermId EXCEPT ![n] = election_replicationLeadershipTermId[n]]
           /\ Election_State_CANVASS(n, 0)
           /\ UNCHANGED <<nodeStateFile_candidateTermId, nodeStateFile_logPosition, log,
-                         commitPosition, leaderMember, logReplay, leadershipTermId,
+                         commitPosition, leaderMember, leadershipTermId,
                          lastAppendPosition, notifiedCommitPosition,
                          election_logPosition, election_leadershipTermId,
-                         election_candidateTermId, election_notifiedCommitPosition,
-                         election_catchupJoinPosition, election_logSubscription,
-                         network>>
+                         election_candidateTermId, election_notifiedCommitPosition, network>>
        \/ /\ logReplication[n] /= Null
           /\ Election_PublishFollowerReplicationPosition(n)
        \/ /\ LogReplication_IsDone(logReplication[n])
           /\ election_notifiedCommitPosition[n] < election_appendPosition[n]
           /\ Election_HandleError(n)
-          /\ UNCHANGED <<persistent_state, role, commitPosition, leaderMember, logReplay,
-                         leadershipTermId, logReplication, lastAppendPosition, notifiedCommitPosition,
+          /\ UNCHANGED <<persistent_state, role, commitPosition, leaderMember,
+                         leadershipTermId, lastAppendPosition, notifiedCommitPosition,
                          election_appendPosition, election_logLeadershipTermId, election_leadershipTermId,
                          election_candidateTermId, election_notifiedCommitPosition,
-                         election_leaderMember,
-                         election_catchupJoinPosition, election_logSubscription,
-                         member_fields, network>>
+                         election_leaderMember, member_fields, network>>
 
 Election_FollowerReplay(n) ==
     /\ election_state[n] = "FOLLOWER_REPLAY"
@@ -658,11 +651,11 @@ Election_FollowerReplay(n) ==
                 /\ election_notifiedCommitPosition[n] /= 0
                 /\ election_logPosition[n] >= election_notifiedCommitPosition[n]
                 /\ Election_State_CANVASS(n, 0)
-                /\ UNCHANGED <<persistent_state, commitPosition, leaderMember, logReplay, leadershipTermId,
-                               logReplication, lastAppendPosition, notifiedCommitPosition,
+                /\ UNCHANGED <<persistent_state, commitPosition, leaderMember, leadershipTermId,
+                               lastAppendPosition, notifiedCommitPosition,
                                election_logPosition, election_appendPosition, election_logLeadershipTermId,
                                election_leadershipTermId, election_candidateTermId, election_notifiedCommitPosition,
-                               election_catchupJoinPosition, election_logSubscription, network>>
+                               network>>
              \/ /\ election_logPosition[n] < election_appendPosition[n]
                 /\ election_notifiedCommitPosition[n] /= 0
                 /\ election_logPosition[n] < election_notifiedCommitPosition[n]
@@ -740,14 +733,11 @@ Election_FollowerCatchupInit(n) ==
                          election_replicationTermBaseLogPosition,
                          member_fields, checker_vars>>
        \/ /\ Election_HandleError(n)
-          /\ UNCHANGED <<persistent_state, role, commitPosition, leaderMember, logReplay, leadershipTermId,
-                         logReplication, lastAppendPosition, notifiedCommitPosition, network,
-                         election_appendPosition,
-                         election_logLeadershipTermId, election_leadershipTermId,
+          /\ UNCHANGED <<persistent_state, role, commitPosition, leaderMember, leadershipTermId,
+                         lastAppendPosition, notifiedCommitPosition, network,
+                         election_appendPosition, election_logLeadershipTermId, election_leadershipTermId,
                          election_candidateTermId, election_notifiedCommitPosition,
-                         election_leaderMember,
-                         election_catchupJoinPosition, election_logSubscription,
-                         member_fields>>
+                         election_leaderMember, member_fields>>
 
 Election_FollowerCatchupAwait(n) ==
     /\ election_state[n] = "FOLLOWER_CATCHUP_AWAIT"
@@ -765,14 +755,11 @@ Election_FollowerCatchupAwait(n) ==
                          member_fields, network, checker_vars>>
        \/ /\ election_logSubscription[n] = Null \/ election_logSubscription[n].position = Null
           /\ Election_HandleError(n)
-          /\ UNCHANGED <<persistent_state, role, commitPosition, leaderMember, logReplay, leadershipTermId,
-                         logReplication, lastAppendPosition, notifiedCommitPosition,
-                         election_appendPosition,
-                         election_logLeadershipTermId, election_leadershipTermId,
+          /\ UNCHANGED <<persistent_state, role, commitPosition, leaderMember, leadershipTermId,
+                         lastAppendPosition, notifiedCommitPosition,
+                         election_appendPosition, election_logLeadershipTermId, election_leadershipTermId,
                          election_candidateTermId, election_notifiedCommitPosition,
-                         election_leaderMember,
-                         election_catchupJoinPosition, election_logSubscription,
-                         member_fields, network>>
+                         election_leaderMember, member_fields, network>>
 
 CM_UpdateFollowerPosition(n) ==
     /\ election_leaderMember[n] /= Null
@@ -840,11 +827,10 @@ Election_FollowerCatchup(n) ==
                          election_replicationTermBaseLogPosition,
                          member_fields, network, checker_vars>>
        \/ /\ Election_HandleError(n)
-          /\ UNCHANGED <<persistent_state, module_fields, election_appendPosition,
+          /\ UNCHANGED <<persistent_state, non_replication_module_fields, election_appendPosition,
                          election_logLeadershipTermId, election_leadershipTermId,
                          election_candidateTermId, election_notifiedCommitPosition,
-                         election_leaderMember, election_catchupJoinPosition, election_logSubscription,
-                         member_fields, network>>
+                         election_leaderMember, member_fields, network>>
 
 Election_FollowerLogInit(n) ==
     /\ election_state[n] = "FOLLOWER_LOG_INIT"
@@ -890,14 +876,11 @@ Election_FollowerLogAwait(n) ==
                          election_replicationTermBaseLogPosition,
                          member_fields, network, checker_vars>>
        \/ /\ Election_HandleError(n)
-          /\ UNCHANGED <<persistent_state, role, commitPosition, leaderMember, logReplay, leadershipTermId,
-                         logReplication, lastAppendPosition, notifiedCommitPosition,
+          /\ UNCHANGED <<persistent_state, role, commitPosition, leaderMember, leadershipTermId,
+                         lastAppendPosition, notifiedCommitPosition,
                          election_appendPosition, election_logLeadershipTermId,
                          election_leadershipTermId, election_candidateTermId,
-                         election_notifiedCommitPosition,
-                         election_leaderMember, election_catchupJoinPosition,
-                         election_logSubscription,
-                         member_fields, network>>
+                         election_notifiedCommitPosition, election_leaderMember, member_fields, network>>
 
 Election_FollowerReady(n) ==
     /\ election_state[n] = "FOLLOWER_READY"
@@ -912,12 +895,11 @@ Election_FollowerReady(n) ==
           /\ UNCHANGED <<persistent_state, role, logReplay,
                          logReplication, lastAppendPosition, election_fields, member_fields, checker_vars>>
        \/ /\ Election_HandleError(n)
-          /\ UNCHANGED <<persistent_state, role, commitPosition, leaderMember, logReplay, leadershipTermId,
-                         logReplication, lastAppendPosition, notifiedCommitPosition,
+          /\ UNCHANGED <<persistent_state, role, commitPosition, leaderMember, leadershipTermId,
+                         lastAppendPosition, notifiedCommitPosition,
                          election_appendPosition, election_logLeadershipTermId,
                          election_leadershipTermId, election_candidateTermId, election_notifiedCommitPosition,
-                         election_leaderMember, election_catchupJoinPosition, election_logSubscription,
-                         member_fields, network>>
+                         election_leaderMember, member_fields, network>>
 
 CM_EnterElection(n) ==
     /\ role' = [role EXCEPT ![n] = "FOLLOWER"]
@@ -1007,10 +989,9 @@ Election_OnCanvassPosition(n, msg, newNetwork) ==
              /\ election_state[n] \in {"LEADER_LOG_REPLICATION", "LEADER_READY"}
              /\ Election_HandleError(n)
              /\ network' = newNetwork
-             /\ UNCHANGED <<persistent_state, module_fields, election_appendPosition,
+             /\ UNCHANGED <<persistent_state, non_replication_module_fields, election_appendPosition,
                             election_logLeadershipTermId, election_leadershipTermId,
-                            election_candidateTermId, election_notifiedCommitPosition,
-                            election_leaderMember, election_catchupJoinPosition, election_logSubscription,
+                            election_candidateTermId, election_notifiedCommitPosition, election_leaderMember,
                             clusterMembers_vote, clusterMembers_isBallotSent, clusterMembers_candidateTermId>>
           \/ /\ \/ msg.logLeadershipTermId = election_leadershipTermId[n]
                 \/ /\ msg.logLeadershipTermId < election_leadershipTermId[n]
@@ -1126,10 +1107,9 @@ Election_OnCommitPosition(n, msg) ==
           \/ /\ msg.leadershipTermId > election_leadershipTermId[n]
              /\ election_state[n] = "LEADER_READY"
              /\ Election_HandleError(n)
-             /\ UNCHANGED <<persistent_state, module_fields, election_appendPosition,
+             /\ UNCHANGED <<persistent_state, non_replication_module_fields, election_appendPosition,
                             election_logLeadershipTermId, election_leadershipTermId, election_candidateTermId,
-                            election_notifiedCommitPosition, election_leaderMember,
-                            election_catchupJoinPosition, election_logSubscription, member_fields>>
+                            election_notifiedCommitPosition, election_leaderMember, member_fields>>
 
 CM_OnCommitPosition(n, msg, newNetwork) ==
     /\ msg.type = "CommitPosition"
@@ -1183,20 +1163,19 @@ Election_OnNewLeadershipTerm(n, msg) ==
                              recordingLog' = recordingLog
                    /\ Election_HandleError(n)
                    /\ UNCHANGED <<nodeStateFile_candidateTermId, nodeStateFile_logPosition,
-                                  role, commitPosition, leaderMember, logReplay, leadershipTermId,
-                                  logReplication, lastAppendPosition, notifiedCommitPosition,
+                                  role, commitPosition, leaderMember, leadershipTermId,
+                                  lastAppendPosition, notifiedCommitPosition,
                                   election_appendPosition, election_logLeadershipTermId, election_leadershipTermId,
                                   election_candidateTermId, election_notifiedCommitPosition,
-                                  election_leaderMember, election_catchupJoinPosition, election_logSubscription,
-                                  member_fields>>
+                                  election_leaderMember, member_fields>>
                 \/ /\ \/ msg.nextTermBaseLogPosition = NullValue
                       \/ msg.nextTermBaseLogPosition >= election_appendPosition[n]
                    /\ election_leaderMember' = [election_leaderMember EXCEPT ![n] = msg.leaderMember]
                    /\ election_leadershipTermId' = [election_leadershipTermId EXCEPT ![n] = msg.leadershipTermId]
                    /\ election_candidateTermId' = [election_candidateTermId EXCEPT ![n] = Max({election_candidateTermId[n], msg.leadershipTermId})]
-                   /\ election_catchupJoinPosition' = [election_catchupJoinPosition EXCEPT ![n] = IF election_appendPosition[n] < msg.logPosition THEN msg.logPosition ELSE NullValue]
                    /\ election_notifiedCommitPosition' = [election_notifiedCommitPosition EXCEPT ![n] = Max({election_notifiedCommitPosition[n], msg.commitPosition})]
                    /\ \/ /\ election_appendPosition[n] >= msg.termBaseLogPosition
+                         /\ election_catchupJoinPosition' = [election_catchupJoinPosition EXCEPT ![n] = IF election_appendPosition[n] < msg.logPosition THEN msg.logPosition ELSE NullValue]
                          /\ election_state' = [election_state EXCEPT ![n] = "FOLLOWER_REPLAY"]
                          /\ UNCHANGED <<persistent_state, role, commitPosition, leaderMember, logReplay,
                                         leadershipTermId, logReplication, lastAppendPosition,
@@ -1207,11 +1186,12 @@ Election_OnNewLeadershipTerm(n, msg) ==
                       \/ /\ election_appendPosition[n] < msg.termBaseLogPosition
                          /\ \/ /\ msg.nextLeadershipTermId = NullValue
                                /\ Election_HandleError(n)
-                               /\ UNCHANGED <<persistent_state, role, commitPosition, leaderMember, logReplay,
-                                              leadershipTermId, logReplication, lastAppendPosition,
+                               /\ UNCHANGED <<persistent_state, role, commitPosition, leaderMember,
+                                              leadershipTermId, lastAppendPosition,
                                               notifiedCommitPosition, election_appendPosition,
-                                              election_logLeadershipTermId, election_logSubscription, member_fields>>
+                                              election_logLeadershipTermId, member_fields>>
                             \/ /\ msg.nextLeadershipTermId /= NullValue
+                               /\ election_catchupJoinPosition' = [election_catchupJoinPosition EXCEPT ![n] = IF election_appendPosition[n] < msg.logPosition THEN msg.logPosition ELSE NullValue]
                                /\ \/ /\ election_appendPosition[n] < msg.nextTermBaseLogPosition
                                      /\ election_replicationLeadershipTermId' = [election_replicationLeadershipTermId EXCEPT ![n] = msg.logLeadershipTermId]
                                      /\ election_replicationStopPosition' = [election_replicationStopPosition EXCEPT ![n] = msg.nextTermBaseLogPosition]
