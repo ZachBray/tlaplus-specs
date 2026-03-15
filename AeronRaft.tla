@@ -115,7 +115,7 @@ Init ==
     /\ clusterMembers_isBallotSent = [n \in Nodes |-> [m \in Nodes |-> FALSE]]
     /\ clusterMembers_leadershipTermId = [n \in Nodes |-> [m \in Nodes |-> NullValue]]
     /\ clusterMembers_logPosition = [n \in Nodes |-> [m \in Nodes |-> NullValue]]
-    /\ checker_timeoutCount = [n \in Nodes |-> 0]
+    /\ checker_timeoutCount = 0
 
 persistent_state == <<nodeStateFile_candidateTermId, nodeStateFile_logPosition, log, recordingLog>>
 
@@ -182,7 +182,7 @@ Election_HandleError(n) ==
     /\ ResetUnusedFields(n)
     /\ election_state' = [election_state EXCEPT ![n] = "INIT"]
     /\ election_logPosition' = [election_logPosition EXCEPT ![n] = commitPosition[n]]
-    /\ checker_timeoutCount' = [ checker_timeoutCount EXCEPT ![n] = checker_timeoutCount[n] + 1 ]
+    /\ checker_timeoutCount' = checker_timeoutCount + 1
 
 \* Models the transition to CANVASS from other states, which resets members etc.
 Election_State_CANVASS(n, timeoutCount) ==
@@ -197,7 +197,7 @@ Election_State_CANVASS(n, timeoutCount) ==
     /\ election_leaderMember' = [election_leaderMember EXCEPT ![n] = Null]
     /\ role' = [role EXCEPT ![n] = "FOLLOWER"]
     /\ ResetUnusedFields(n)
-    /\ checker_timeoutCount' = [ checker_timeoutCount EXCEPT ![n] = checker_timeoutCount[n] + timeoutCount ]
+    /\ checker_timeoutCount' = checker_timeoutCount + timeoutCount
 
 Election_State_CANDIDATE_BALLOT(n) ==
     /\ election_state' = [election_state EXCEPT ![n] = "CANDIDATE_BALLOT"]
@@ -1368,6 +1368,7 @@ CM_ConsensusWork(n) ==
              IN CM_UpdateLeaderPosition(n, appendPos, quorumPos)
        \/ /\ role[n] = "FOLLOWER"
           /\ CM_EnterElection(n)
+          /\ checker_timeoutCount' = checker_timeoutCount + 1
           /\ UNCHANGED <<persistent_state, commitPosition, leaderMember, logReplay,
                          leadershipTermId, logReplication, lastAppendPosition,
                          notifiedCommitPosition, member_fields, network, checker_vars>>
@@ -1559,7 +1560,13 @@ StateConstraint ==
                      /\ nodeStateFile_candidateTermId[n] <= 2
                      /\ election_candidateTermId[n] <= 2
                      /\ leadershipTermId[n] <= 1
-                     /\ checker_timeoutCount[n] <= 2
+                     /\ checker_timeoutCount <= 4
+
+\*    \A n \in Nodes : /\ Len(log[n]) <= 4
+\*                     /\ nodeStateFile_candidateTermId[n] <= 3
+\*                     /\ election_candidateTermId[n] <= 3
+\*                     /\ leadershipTermId[n] <= 3
+\*                     /\ checker_timeoutCount <= 5
 
 \* Type invariant to catch basic errors
 TypeInvariant ==
@@ -1601,7 +1608,6 @@ Debug_AnotherLeader ==
 \* Invariant for debugging that will be falsified when multiple elections have completed on all nodes.
 Debug_CompleteMultipleElections ==
     ~ \E n \in Nodes : /\ election_state[n] = "CLOSED"
-                       \* /\ leadershipTermId[n] > 0
                        /\ \E i1, i2 \in DOMAIN log[n] : /\ i1 /= i2
                                                         /\ log[n][i1].type = "NewLeadershipTerm"
                                                         /\ log[n][i2].type = "NewLeadershipTerm"
