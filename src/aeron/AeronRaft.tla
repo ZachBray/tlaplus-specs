@@ -145,14 +145,16 @@ Max(S) == CHOOSE x \in S : \A y \in S : x >= y
 
 Min(S) == CHOOSE x \in S : \A y \in S : x <= y
 
-Send0(newNetwork, msg, destinations) ==
-    \* Is for all too strong here?
-    /\ \A d \in destinations : Len(newNetwork[msg.from, d]) < NetworkQueueMaxSize
-    /\ network' = [<<from, to>> \in {msg.from} \X destinations |-> Append(newNetwork[from, to], [to |-> to] @@ msg)] @@ newNetwork
+\* Send with unicast-style backpressure
+Send(newNetwork, msg) ==
+    /\ Len(newNetwork[msg.from, msg.to]) < NetworkQueueMaxSize
+    /\ network' = [newNetwork EXCEPT ![msg.from, msg.to] = Append(newNetwork[msg.from, msg.to], msg)]
 
-Send(newNetwork, msg) == Send0(newNetwork, msg, {msg.to})
-
-Broadcast(newNetwork, msg) == Send0(newNetwork, msg, Nodes \ {msg.from})
+\* Send with mc-max-fc-style backpressure
+Broadcast(newNetwork, msg) ==
+    LET destinations == { d \in Nodes : d /= msg.from /\ Len(newNetwork[msg.from, d]) < NetworkQueueMaxSize }
+    IN /\ destinations /= {}
+       /\ network' = [<<from, to>> \in {msg.from} \X destinations |-> Append(newNetwork[from, to], [to |-> to] @@ msg)] @@ newNetwork
 
 Consume(n, type, MessageHandler(_,_,_)) ==
     \E src \in Nodes :
