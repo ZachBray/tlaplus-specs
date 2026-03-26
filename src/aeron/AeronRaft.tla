@@ -785,17 +785,16 @@ Election_FollowerCatchupAwait(n) ==
           /\ UNCHANGED <<persistent_state, leaderMember, leadershipTermId,
                          notifiedCommitPosition, election_logLeadershipTermId, election_leadershipTermId, network>>
 
-CM_UpdateFollowerPosition(n) ==
-    /\ election_leaderMember[n] /= Null
-    /\ LET position == Len(log[n])
-       IN /\ Send(network, [type |-> "AppendPosition",
-                            from |-> n,
-                            to |-> election_leaderMember[n],
-                            leadershipTermId |-> leadershipTermId[n],
-                            logPosition |-> position])
-          /\ UNCHANGED <<persistent_state, role, commitPosition, leaderMember, logReplay, leadershipTermId,
-                         logReplication, notifiedCommitPosition, election_state, election_fields, member_fields,
-                         checker_vars>>
+CM_UpdateFollowerPosition(n, leader) ==
+    LET position == Len(log[n])
+    IN /\ Send(network, [type |-> "AppendPosition",
+                         from |-> n,
+                         to |-> leader,
+                         leadershipTermId |-> leadershipTermId[n],
+                         logPosition |-> position])
+       /\ UNCHANGED <<persistent_state, role, commitPosition, leaderMember, logReplay, leadershipTermId,
+                      logReplication, notifiedCommitPosition, election_state, election_fields, member_fields,
+                      checker_vars>>
 
 Election_FollowerCatchup(n) ==
     /\ election_state[n] = "FOLLOWER_CATCHUP"
@@ -832,7 +831,7 @@ Election_FollowerCatchup(n) ==
                                   election_replicationLeadershipTermId, election_replicationStopPosition,
                                   election_replicationTermBaseLogPosition,
                                   member_fields, network, checker_vars>>
-       \/ CM_UpdateFollowerPosition(n)
+       \/ CM_UpdateFollowerPosition(n, election_leaderMember[n])
        \/ /\ commitPosition[n] >= election_catchupJoinPosition[n]
           /\ commitPosition[n] >= election_notifiedCommitPosition[n]
           /\ election_appendPosition' = [election_appendPosition EXCEPT ![n] = commitPosition[n]]
@@ -1117,13 +1116,13 @@ CM_OnCommitPosition(n, msg, newNetwork) ==
           /\ Election_OnCommitPosition(n, msg)
        \/ /\ election_state[n] = "CLOSED"
           /\ \/ /\ msg.leadershipTermId = leadershipTermId[n]
-                /\ \/ /\ msg.from = election_leaderMember[n]
+                /\ \/ /\ msg.from = leaderMember[n]
                       /\ role[n] = "FOLLOWER"
                       /\ notifiedCommitPosition' = [notifiedCommitPosition EXCEPT ![n] = msg.logPosition]
                       /\ UNCHANGED <<persistent_state, role, commitPosition, leaderMember, logReplay,
                                      leadershipTermId, logReplication,
                                      election_state, election_fields, member_fields, checker_vars>>
-                   \/ /\ \/ msg.from /= election_leaderMember[n]
+                   \/ /\ \/ msg.from /= leaderMember[n]
                          \/ role[n] /= "FOLLOWER"
                       /\ UNCHANGED <<persistent_state, module_fields, election_state, election_fields, member_fields,
                                      checker_vars>>
@@ -1228,7 +1227,7 @@ CM_OnNewLeadershipTerm(n, msg, newNetwork) ==
        \/ /\ election_state[n] = "CLOSED"
           /\ \/ /\ role[n] = "FOLLOWER"
                 /\ msg.leadershipTermId = leadershipTermId[n]
-                /\ msg.leaderMember = election_leaderMember[n]
+                /\ msg.leaderMember = leaderMember[n]
                 /\ notifiedCommitPosition' = [notifiedCommitPosition EXCEPT ![n] = Max({msg.commitPosition, notifiedCommitPosition[n]})]
                 /\ UNCHANGED <<persistent_state, role, commitPosition, leaderMember, logReplay, leadershipTermId,
                                logReplication, election_state, election_fields, member_fields,
@@ -1238,7 +1237,7 @@ CM_OnNewLeadershipTerm(n, msg, newNetwork) ==
                 /\ UNCHANGED <<persistent_state, notifiedCommitPosition, leaderMember, commitPosition,
                                leadershipTermId>>
              \/ /\ \/ /\ msg.leadershipTermId = leadershipTermId[n]
-                      /\ \/ msg.leaderMember /= election_leaderMember[n]
+                      /\ \/ msg.leaderMember /= leaderMember[n]
                          \/ role[n] /= "FOLLOWER"
                    \/ msg.leadershipTermId < leadershipTermId[n]
                 /\ UNCHANGED <<persistent_state, module_fields, election_state, election_fields, member_fields,
@@ -1376,7 +1375,7 @@ CM_ConsensusWork(n) ==
                                election_replicationLeadershipTermId, election_replicationStopPosition,
                                election_replicationTermBaseLogPosition, member_fields, network, checker_vars>>
        \/ /\ role[n] = "FOLLOWER"
-          /\ CM_UpdateFollowerPosition(n)
+          /\ CM_UpdateFollowerPosition(n, leaderMember[n])
        \/ /\ role[n] = "FOLLOWER"
           /\ notifiedCommitPosition[n] > commitPosition[n]
           /\ Len(log[n]) > commitPosition[n]
