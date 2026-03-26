@@ -1612,29 +1612,32 @@ Debug_Replication == ~HasReplicated
 
 \* Invariant for debugging that will be falsified when the election is completed on all nodes.
 Debug_CompleteElection ==
-    ~(\A n \in Nodes : election_state[n] = "CLOSED" /\ Len(log[n]) > 0)
+    ~ /\ HasReplicated
+      /\ \A n \in Nodes : election_state[n] = "CLOSED"
 
 \* Invariant for debugging that will be falsified when a subsequent election is started and a node progresses to leader.
 Debug_StartAnotherElection ==
-    ~ /\ \A n \in Nodes : Len(log[n]) > 0
-      /\ \E n \in Nodes : /\ role[n] = "CANDIDATE"
-                          /\ \E m \in OtherNodes(n): clusterMembers_isBallotSent[n][m] = TRUE /\ clusterMembers_vote[n][m] = TRUE
+    ~ /\ HasReplicated
+      /\ Cardinality({n \in Nodes : /\ election_state[n] /= "CLOSED"
+                                    /\ election_leaderMember[n] = Null}) >= QuorumSize
+
+\* Invariant for debugging that will be falsified when a subsequent election is started and a node progresses
+\* to become a candidate.
+Debug_AnotherCandidate ==
+    ~ /\ HasReplicated
+      /\ \E n \in Nodes : role[n] = "CANDIDATE"
 
 \* Invariant for debugging that will be falsified when a subsequent election is started and another node progresses
 \* to leader (which is fine for different terms).
 Debug_AnotherLeader ==
-    ~ /\ \A n \in Nodes : Len(log[n]) > 0
-      /\ \E n1, n2 \in Nodes : /\ n1 /= n2
-                               /\ role[n1] = "LEADER"
-                               /\ role[n2] = "LEADER"
+    ~ /\ HasReplicated
+      /\ Cardinality({n \in Nodes : role[n] = "LEADER"}) >= 2
 
 \* Invariant for debugging that will be falsified when multiple elections have completed on all nodes.
 Debug_CompleteMultipleElections ==
-    ~ \E n \in Nodes : /\ election_state[n] = "CLOSED"
-                       /\ \E i1, i2 \in DOMAIN log[n] : /\ i1 /= i2
-                                                        /\ commitPosition[n] >= i1
-                                                        /\ commitPosition[n] >= i2
-                                                        /\ log[n][i1].type = "NewLeadershipTerm"
-                                                        /\ log[n][i2].type = "NewLeadershipTerm"
+    ~ \E n \in Nodes : \* /\ election_state[n] = "CLOSED"
+                       /\ commitPosition[n] >= 2
+                       /\ leadershipTermId[n] >= 1
+                       /\ Len(SelectSeq(log[n], LAMBDA entry: entry.type = "NewLeadershipTerm")) >= 2
 
 =============================================================================
