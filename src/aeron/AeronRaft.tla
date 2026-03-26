@@ -6,7 +6,6 @@ EXTENDS Naturals, Integers, FiniteSets, Sequences, TLC
 CONSTANT Nodes
 CONSTANT Payloads
 CONSTANT Null
-CONSTANT NetworkQueueMaxSize
 
 VARIABLE nodeStateFile_candidateTermId
 VARIABLE nodeStateFile_logPosition
@@ -72,6 +71,16 @@ ElectionState == {
     "CLOSED"
 }
 
+MessageTypes == {
+    "CanvassPosition",
+    "RequestVote",
+    "Vote",
+    "CatchupPosition",
+    "NewLeadershipTerm",
+    "AppendPosition",
+    "CommitPosition"
+}
+
 OptionalNode == Nodes \cup {Null}
 
 Quorums == { selection \in SUBSET Nodes : 2 * Cardinality(selection) > Cardinality(Nodes) }
@@ -83,7 +92,7 @@ SomeValue == 1
 EmptyFunction == [x \in {} |-> x]
 
 Init ==
-    /\ network = [src \in Nodes, dest \in Nodes |-> << >>]
+    /\ network = [src \in Nodes, dest \in Nodes |-> Null]
     /\ nodeStateFile_candidateTermId = [n \in Nodes |-> NullValue]
     /\ nodeStateFile_logPosition = [n \in Nodes |-> NullValue]
     /\ log = [n \in Nodes |-> << >>]
@@ -139,30 +148,27 @@ checker_vars == <<checker_timeoutCount>>
 
 vars == <<persistent_state, module_fields, election_state, election_fields, member_fields, network, checker_vars>>
 
-Max(S) == CHOOSE x \in S : \A y \in S : x >= y
-
-Min(S) == CHOOSE x \in S : \A y \in S : x <= y
+\*Max(S) == CHOOSE x \in S : \A y \in S : x >= y
+\*
+\*Min(S) == CHOOSE x \in S : \A y \in S : x <= y
 
 \* Send with unicast-style backpressure
 Send(newNetwork, msg) ==
-    /\ Len(newNetwork[msg.from, msg.to]) < NetworkQueueMaxSize
-    /\ network' = [newNetwork EXCEPT ![msg.from, msg.to] = Append(newNetwork[msg.from, msg.to], msg)]
+    /\ newNetwork[msg.from, msg.to] = Null
+    /\ network' = [newNetwork EXCEPT ![msg.from, msg.to] = msg]
 
 \* Send with mc-max-fc-style backpressure
 Broadcast(newNetwork, msg) ==
-    LET destinations == { d \in Nodes : d /= msg.from /\ Len(newNetwork[msg.from, d]) < NetworkQueueMaxSize }
+    LET destinations == { d \in Nodes : d /= msg.from /\ newNetwork[msg.from, d] = Null }
     IN /\ destinations /= {}
-       /\ network' = [<<from, to>> \in {msg.from} \X destinations |-> Append(newNetwork[from, to], [to |-> to] @@ msg)] @@ newNetwork
+       /\ network' = [<<from, to>> \in {msg.from} \X destinations |-> [to |-> to] @@ msg] @@ newNetwork
 
-Consume(n, type, MessageHandler(_,_,_)) ==
-    \E src \in Nodes :
-        /\ Len(network[src, n]) > 0
-        /\ LET msg == Head(network[src, n])
-               newNetwork == [network EXCEPT ![src, n] = Tail(@)] IN
-            /\ type = msg.type
-            /\ MessageHandler(n, msg, newNetwork)
-\*            /\ Assert(ENABLED MessageHandler(n, msg, newNetwork),
-\*                      "Message handler for " \o type \o " was not enabled with message: " \o ToString(msg))
+HasMessage(src, dest, type) ==
+    LET msg == network[src, dest] IN
+    /\ msg /= Null
+    /\ msg.type = type
+
+ConsumeMessage(src, dest) == [network EXCEPT ![src, dest] = Null]
 
 OtherNodes(n) == Nodes \ {n}
 
@@ -323,13 +329,12 @@ Election_CandidateBallot(n) ==
                          election_leadershipTermId, election_candidateTermId, election_notifiedCommitPosition,
                          network>>
        \/ /\ \A m \in OtherNodes(n) : clusterMembers_isBallotSent[n][m] = FALSE
-          \* TODO avoid backpressure from a stalled node here
-          /\ clusterMembers_isBallotSent' = [clusterMembers_isBallotSent EXCEPT ![n] = [m \in Nodes |-> TRUE]]
           /\ Broadcast(network, [type |-> "RequestVote",
                                  from |-> n,
                                  logLeadershipTermId |-> election_logLeadershipTermId[n],
                                  logPosition |-> election_appendPosition[n],
                                  candidateTermId |-> election_candidateTermId[n]])
+          /\ clusterMembers_isBallotSent' = [clusterMembers_isBallotSent EXCEPT ![n] = [m \in Nodes |-> TRUE]]
           /\ UNCHANGED <<persistent_state, module_fields, election_state, election_fields,
                          clusterMembers_vote, clusterMembers_candidateTermId,
                          clusterMembers_leadershipTermId, clusterMembers_logPosition, checker_vars>>
@@ -512,16 +517,14 @@ Election_LeaderInit(n) ==
                    member_fields, network, checker_vars>>
 
 ClusterMember_HasQuorumAtPosition(n) ==
-    \E q \in Quorums : 
-        \A m \in q : 
-            /\ clusterMembers_leadershipTermId[n][m] = election_leadershipTermId[n]
-            /\ clusterMembers_logPosition[n][m] >= election_logPosition[n]
+    Cardinality({ m \in Nodes: /\ clusterMembers_leadershipTermId[n][m] = election_leadershipTermId[n]
+                               /\ clusterMembers_logPosition[n][m] >= election_logPosition[n]}) >= QuorumSize
 
 CM_UpdateLeaderPosition(n, appendPos, quorumPos) ==
     /\ clusterMembers_logPosition' = [clusterMembers_logPosition EXCEPT ![n][n] = appendPos]
     /\ \/ /\ quorumPos > commitPosition[n]
-          /\ commitPosition' = [commitPosition EXCEPT ![n] = quorumPos]
           /\ CM_PublishCommitPosition(n, quorumPos, leadershipTermId[n])
+          /\ commitPosition' = [commitPosition EXCEPT ![n] = quorumPos]
           /\ UNCHANGED <<persistent_state, role, leaderMember, logReplay, leadershipTermId,
                          logReplication, notifiedCommitPosition,
                          election_state, election_fields,
@@ -1393,142 +1396,163 @@ CM_ConsensusWork(n) ==
                                      notifiedCommitPosition, election_state, election_fields,
                                      member_fields, network, checker_vars>>
 
-Adapter_OnAppendPosition(n) == Consume(n, "AppendPosition", CM_OnAppendPosition)
+Adapter_OnAppendPosition(src, dest) ==
+    /\ HasMessage(src, dest, "AppendPosition")
+    /\ CM_OnAppendPosition(dest, network[src, dest], ConsumeMessage(src, dest))
 
-Adapter_OnCanvassPosition(n) == Consume(n, "CanvassPosition", CM_OnCanvassPosition)
+Adapter_OnCanvassPosition(src, dest) ==
+    /\ HasMessage(src, dest, "CanvassPosition")
+    /\ CM_OnCanvassPosition(dest, network[src, dest], ConsumeMessage(src, dest))
 
-Adapter_OnCatchupPosition(n) == Consume(n, "CatchupPosition", CM_OnCatchupPosition)
+Adapter_OnCatchupPosition(src, dest) ==
+    /\ HasMessage(src, dest, "CatchupPosition")
+    /\ CM_OnCatchupPosition(dest, network[src, dest], ConsumeMessage(src, dest))
 
-Adapter_OnCommitPosition(n) == Consume(n, "CommitPosition", CM_OnCommitPosition)
+Adapter_OnCommitPosition(src, dest) ==
+    /\ HasMessage(src, dest, "CommitPosition")
+    /\ CM_OnCommitPosition(dest, network[src, dest], ConsumeMessage(src, dest))
 
-Adapter_OnNewLeadershipTerm(n) == Consume(n, "NewLeadershipTerm", CM_OnNewLeadershipTerm)
+Adapter_OnNewLeadershipTerm(src, dest) ==
+    /\ HasMessage(src, dest, "NewLeadershipTerm")
+    /\ CM_OnNewLeadershipTerm(dest, network[src, dest], ConsumeMessage(src, dest))
 
-Adapter_OnRequestVote(n) == Consume(n, "RequestVote", CM_OnRequestVote)
+Adapter_OnRequestVote(src, dest) ==
+    /\ HasMessage(src, dest, "RequestVote")
+    /\ CM_OnRequestVote(dest, network[src, dest], ConsumeMessage(src, dest))
 
-Adapter_OnVote(n) == Consume(n, "Vote", CM_OnVote)
+Adapter_OnVote(src, dest) ==
+    /\ HasMessage(src, dest, "Vote")
+    /\ CM_OnVote(dest, network[src, dest], ConsumeMessage(src, dest))
 
-Next == \/ \E n \in Nodes :
-                         \* Publish positions, transition to NOMINATE if a quorum of members would vote for us
-                         \/ Election_Canvass(n)
+MessageLoss(src, dest) ==
+    /\ network[src, dest] /= Null
+    /\ network' = [network EXCEPT ![src, dest] = Null]
+    /\ UNCHANGED <<persistent_state, module_fields, election_state, election_fields, member_fields, checker_vars>>
 
-                         \* Increment candidate term id, transition to CANDIDATE_BALLOT
-                         \/ Election_Nominate(n)
+Next ==
+    \/ \E n \in Nodes :
+        \* Publish positions, transition to NOMINATE if a quorum of members would vote for us
+        \/ Election_Canvass(n)
 
-                         \* Send request vote messages, transition to LEADER_LOG_REPLICATION if we get enough votes.
-                         \* Otherwise, back to CANVASS on timeout
-                         \/ Election_CandidateBallot(n)
+        \* Increment candidate term id, transition to CANDIDATE_BALLOT
+        \/ Election_Nominate(n)
 
-                         \* Back to CANVASS on timeout
-                         \/ Election_FollowerBallot(n)
+        \* Send request vote messages, transition to LEADER_LOG_REPLICATION if we get enough votes.
+        \* Otherwise, back to CANVASS on timeout
+        \/ Election_CandidateBallot(n)
 
-                         \* Publish leadership term and commit position, transition to LEADER_REPLAY once a quorum has
-                         \* replicated our (entire) log
-                         \/ Election_LeaderLogReplication(n)
+        \* Back to CANVASS on timeout
+        \/ Election_FollowerBallot(n)
 
-                         \* Publish leadership term and commit position, replay leadership term messages in the log,
-                         \* update recording log, transition to LEADER_INIT once replay is complete
-                         \/ Election_LeaderReplay(n)
+        \* Publish leadership term and commit position, transition to LEADER_REPLAY once a quorum has
+        \* replicated our (entire) log
+        \/ Election_LeaderLogReplication(n)
 
-                         \* Set role to be LEADER, update recording log with new term, transition to LEADER_READY
-                         \/ Election_LeaderInit(n)
+        \* Publish leadership term and commit position, replay leadership term messages in the log,
+        \* update recording log, transition to LEADER_INIT once replay is complete
+        \/ Election_LeaderReplay(n)
 
-                         \* Set leadershipTermId to the value from election, publish leadership term and "commit"
-                         \* position, transition to CLOSED once a quorum has replicated to the log position and term
-                         \/ Election_LeaderReady(n)
+        \* Set role to be LEADER, update recording log with new term, transition to LEADER_READY
+        \/ Election_LeaderInit(n)
 
-                         \* Arrives here via the receipt of a NewLeadershipTerm message.
-                         \* Publishes replication/append position, replicates the log entries from the leader who sent
-                         \* us a NewLeadershipTerm message up to the next term, heads back to CANVASS once complete.
-                         \* Continues "looping" to replicate until within the current term, at which point a subsequent
-                         \* NewLeadershipTerm message will trigger a transition to FOLLOWER_REPLAY.
-                         \/ Election_FollowerLogReplication(n)
+        \* Set leadershipTermId to the value from election, publish leadership term and "commit"
+        \* position, transition to CLOSED once a quorum has replicated to the log position and term
+        \/ Election_LeaderReady(n)
 
-                         \* Arrives here via the receipt of a NewLeadershipTerm message.
-                         \* Replays the local log to process leadership terms,
-                         \* upon completion, it will transition to either FOLLOWER_CATCHUP_INIT, FOLLOWER_LOG_INIT,
-                         \* or CANVASS, depending on whether we've fully caught up with the last known log position
-                         \* the leader sent.
-                         \/ Election_FollowerReplay(n)
+        \* Arrives here via the receipt of a NewLeadershipTerm message.
+        \* Publishes replication/append position, replicates the log entries from the leader who sent
+        \* us a NewLeadershipTerm message up to the next term, heads back to CANVASS once complete.
+        \* Continues "looping" to replicate until within the current term, at which point a subsequent
+        \* NewLeadershipTerm message will trigger a transition to FOLLOWER_REPLAY.
+        \/ Election_FollowerLogReplication(n)
 
-                         \* Sends a CatchupPosition message to the leader, then transitions to FOLLOWER_CATCHUP_AWAIT,
-                         \* waiting for the leader to start replaying its log. Can timeout and transition back to INIT.
-                         \/ Election_FollowerCatchupInit(n)
+        \* Arrives here via the receipt of a NewLeadershipTerm message.
+        \* Replays the local log to process leadership terms,
+        \* upon completion, it will transition to either FOLLOWER_CATCHUP_INIT, FOLLOWER_LOG_INIT,
+        \* or CANVASS, depending on whether we've fully caught up with the last known log position
+        \* the leader sent.
+        \/ Election_FollowerReplay(n)
 
-                         \* Waits for the leader to start replaying its log, then transitions to FOLLOWER_CATCHUP;
-                         \* unless the logPosition and replay join position do not agree, or there is a timeout,
-                         \* in which case it transitions back to INIT.
-                         \/ Election_FollowerCatchupAwait(n)
+        \* Sends a CatchupPosition message to the leader, then transitions to FOLLOWER_CATCHUP_AWAIT,
+        \* waiting for the leader to start replaying its log. Can timeout and transition back to INIT.
+        \/ Election_FollowerCatchupInit(n)
 
-                         \* Polls the replay from the leader, sends append position periodically,
-                         \* updates commit position, transitions to FOLLOWER_LOG_INIT once the replayed position reaches
-                         \* the maximum known log position of a leader from a NewLeadershipTerm message. Can time out
-                         \* and transition back to INIT if no progress is made.
-                         \/ Election_FollowerCatchup(n)
+        \* Waits for the leader to start replaying its log, then transitions to FOLLOWER_CATCHUP;
+        \* unless the logPosition and replay join position do not agree, or there is a timeout,
+        \* in which case it transitions back to INIT.
+        \/ Election_FollowerCatchupAwait(n)
 
-                         \* Transitions to FOLLOWER_READY if the live log subscription is already established;
-                         \* otherwise, it creates the subscription and waits for it to become connected via
-                         \* FOLLOWER_LOG_AWAIT.
-                         \/ Election_FollowerLogInit(n)
+        \* Polls the replay from the leader, sends append position periodically,
+        \* updates commit position, transitions to FOLLOWER_LOG_INIT once the replayed position reaches
+        \* the maximum known log position of a leader from a NewLeadershipTerm message. Can time out
+        \* and transition back to INIT if no progress is made.
+        \/ Election_FollowerCatchup(n)
 
-                         \* Waits for the live log subscription to become connected, which isn't modelled here.
-                         \* Updates the recording log and logLeadershipTermId, then transitions to FOLLOWER_READY.
-                         \* Can time out and transition back to INIT if the subscription fails to connect.
-                         \/ Election_FollowerLogAwait(n)
+        \* Transitions to FOLLOWER_READY if the live log subscription is already established;
+        \* otherwise, it creates the subscription and waits for it to become connected via
+        \* FOLLOWER_LOG_AWAIT.
+        \/ Election_FollowerLogInit(n)
 
-                         \* Sends an AppendPosition message to the leader to indicate we're ready, then transitions
-                         \* to CLOSED and completes the election. Can time out and transition back to INIT if unable
-                         \* to send the message.
-                         \/ Election_FollowerReady(n)
+        \* Waits for the live log subscription to become connected, which isn't modelled here.
+        \* Updates the recording log and logLeadershipTermId, then transitions to FOLLOWER_READY.
+        \* Can time out and transition back to INIT if the subscription fails to connect.
+        \/ Election_FollowerLogAwait(n)
 
-                         \* Node receives an AppendPosition message and updates the "follower's" positions if its
-                         \* leadership term is less-than-or-equal-to the election's leadership term.
-                         \* Note that there is no LEADER check.
-                         \/ Adapter_OnAppendPosition(n)
+        \* Sends an AppendPosition message to the leader to indicate we're ready, then transitions
+        \* to CLOSED and completes the election. Can time out and transition back to INIT if unable
+        \* to send the message.
+        \/ Election_FollowerReady(n)
 
-                         \* Node receives a CanvassPosition message and, if it is the leader, responds with a
-                         \* NewLeadershipTerm message containing the information for the next term after the
-                         \* message's logLeadershipTerm.
-                         \/ Adapter_OnCanvassPosition(n)
+        \* Node performs consensus work when not in an election. On the leader, the node might
+        \* append to the log, or publish its commit position. On a follower, node will replay the
+        \* replicated log up to the notifiedCommitPosition, or it might enter an election on a timeout.
+        \/ CM_ConsensusWork(n)
 
-                         \* Node receives a CatchupPosition message and, if it is the leader, starts a catchup replay
-                         \* for the follower.
-                         \/ Adapter_OnCatchupPosition(n)
+    \/ \E src, dest \in Nodes:
+            \* Node receives an AppendPosition message and updates the "follower's" positions if its
+            \* leadership term is less-than-or-equal-to the election's leadership term.
+            \* Note that there is no LEADER check.
+            \/ Adapter_OnAppendPosition(src, dest)
 
-                         \* Node receives a CommitPosition message and updates its notified commit position
-                         \* if the message is from the currently "accepted" leader, or reverts to INIT if
-                         \* the message is from a new leader with a higher term.
-                         \/ Adapter_OnCommitPosition(n)
+            \* Node receives a CanvassPosition message and, if it is the leader, responds with a
+            \* NewLeadershipTerm message containing the information for the next term after the
+            \* message's logLeadershipTerm.
+            \/ Adapter_OnCanvassPosition(src, dest)
 
-                         \* Node receives a NewLeadershipTerm message and enters an election if the term is higher than
-                         \* its current term. If already in an election, it updates its election state with the
-                         \* information from the message, and may transition to INIT, CANVASS, FOLLOWER_REPLAY, or
-                         \* FOLLOWER_LOG_REPLICATION. It is worth noting the node may also truncate its log if the
-                         \* new leadership term's log position is behind the node's current append position.
-                         \/ Adapter_OnNewLeadershipTerm(n)
+            \* Node receives a CatchupPosition message and, if it is the leader, starts a catchup replay
+            \* for the follower.
+            \/ Adapter_OnCatchupPosition(src, dest)
 
-                         \* Node receives a RequestVote message and decides whether to vote for the candidate or not
-                         \* depending on the candidate's candidate term and log position. Enters FOLLOWER_BALLOT if it
-                         \* votes for the candidate. When not in an election, receiving a RequestVote message with a
-                         \* higher candidate term causes the node to enter an election.
-                         \/ Adapter_OnRequestVote(n)
+            \* Node receives a CommitPosition message and updates its notified commit position
+            \* if the message is from the currently "accepted" leader, or reverts to INIT if
+            \* the message is from a new leader with a higher term.
+            \/ Adapter_OnCommitPosition(src, dest)
 
-                         \* Node receives a Vote message and if in the CANDIDATE_BALLOT state and the message matches
-                         \* the candidate term, it updates the vote and log information for the sender of the message.
-                         \/ Adapter_OnVote(n)
+            \* Node receives a NewLeadershipTerm message and enters an election if the term is higher than
+            \* its current term. If already in an election, it updates its election state with the
+            \* information from the message, and may transition to INIT, CANVASS, FOLLOWER_REPLAY, or
+            \* FOLLOWER_LOG_REPLICATION. It is worth noting the node may also truncate its log if the
+            \* new leadership term's log position is behind the node's current append position.
+            \/ Adapter_OnNewLeadershipTerm(src, dest)
 
-                         \* Node performs consensus work when not in an election. On the leader, the node might
-                         \* append to the log, or publish its commit position. On a follower, node will replay the
-                         \* replicated log up to the notifiedCommitPosition, or it might enter an election on a timeout.
-                         \/ CM_ConsensusWork(n)
+            \* Node receives a RequestVote message and decides whether to vote for the candidate or not
+            \* depending on the candidate's candidate term and log position. Enters FOLLOWER_BALLOT if it
+            \* votes for the candidate. When not in an election, receiving a RequestVote message with a
+            \* higher candidate term causes the node to enter an election.
+            \/ Adapter_OnRequestVote(src, dest)
 
-                         \* Perturbations to add later:
-                         \*  - Message loss
-                         \*  - Node restart (keeping persistent data only)
+            \* Node receives a Vote message and if in the CANDIDATE_BALLOT state and the message matches
+            \* the candidate term, it updates the vote and log information for the sender of the message.
+            \/ Adapter_OnVote(src, dest)
 
-                         \* Safety invariants to add:
-                         \*  - No log disagreements up to the commit position on each node
-                         \*  - Only one leader per term
-                         \*  - Commited entries must reside on a quorum of nodes
+\*            \/ MessageLoss(src, dest)
+            \* Perturbations to add later:
+            \*  - Node restart (keeping persistent data only)
+
+            \* Safety invariants to add:
+            \*  - No log disagreements up to the commit position on each node
+            \*  - Only one leader per term
+            \*  - Commited entries must reside on a quorum of nodes
 
 Spec == Init /\ [][Next]_vars
 
@@ -1566,6 +1590,8 @@ TypeInvariant ==
     /\ \A n \in Nodes : leadershipTermId[n] \in Int
     /\ \A n \in Nodes : election_candidateTermId[n] \in Int
     /\ \A n \in Nodes : nodeStateFile_candidateTermId[n] \in Int
+    /\ \A n, m \in Nodes : \/ network[n, m] = Null
+                           \/ network[n, m].type \in MessageTypes
 
 \* Invariant for debugging that will be falsified when replication works to some extent.
 HasReplicated ==
