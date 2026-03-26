@@ -1,5 +1,5 @@
 -------------------------- MODULE AeronRaft --------------------------
-EXTENDS Naturals, Integers, FiniteSets, Sequences, TLC
+EXTENDS Naturals, Integers, FiniteSets, Sequences, SequencesExt, TLC
 
 \* Based on Aeron commit 717903af0087e2c488f292e3577fb44ec1d52a01.
 
@@ -83,7 +83,7 @@ MessageTypes == {
 
 OptionalNode == Nodes \cup {Null}
 
-Quorums == { selection \in SUBSET Nodes : 2 * Cardinality(selection) > Cardinality(Nodes) }
+QuorumSize == Cardinality(Nodes) \div 2 + 1
 
 NullValue == 0 - 1
 
@@ -271,7 +271,7 @@ ClusterMember_WillVoteFor(perspective, candidate, other) ==
 Election_Canvass(n) ==
     /\ election_state[n] = "CANVASS"
     /\ \/ Election_PublishCanvassPosition(n)
-       \/ /\ \E q \in Quorums : \A m \in q : ClusterMember_WillVoteFor(n, n, m)
+       \/ /\ Cardinality({m \in Nodes : ClusterMember_WillVoteFor(n, n, m)}) >= QuorumSize
           /\ election_state' = [election_state EXCEPT ![n] = "NOMINATE"]
           /\ UNCHANGED <<persistent_state, module_fields, election_fields, member_fields, network, checker_vars>>
 
@@ -305,7 +305,7 @@ Election_Nominate(n) ==
                             clusterMembers_leadershipTermId, clusterMembers_logPosition, network, checker_vars>>
 
 IsQuorumLeader(n) ==
-    /\ \E q \in Quorums : \A m \in q : clusterMembers_vote[n][m] = TRUE
+    /\ Cardinality({ m \in Nodes: clusterMembers_vote[n][m] = TRUE}) >= QuorumSize
     /\ \A m \in Nodes : clusterMembers_vote[n][m] /= FALSE
 
 Election_CandidateBallot(n) ==
@@ -347,8 +347,10 @@ Election_FollowerBallot(n) ==
                    election_logPosition, election_appendPosition, election_logLeadershipTermId,
                    election_leadershipTermId, election_candidateTermId, election_notifiedCommitPosition, network>>
 
-QuorumPosition(n, q) == Min({ clusterMembers_logPosition[n][m] : m \in q })
-MaxQuorumPosition(n) == Max({ QuorumPosition(n, q) : q \in Quorums })
+NodesSeq == SetToSeq(Nodes)
+MaxQuorumPosition(n) ==
+    LET sortedNodes == SortSeq(NodesSeq, LAMBDA x, y : clusterMembers_logPosition[n][x] > clusterMembers_logPosition[n][y])
+    IN clusterMembers_logPosition[n][sortedNodes[QuorumSize]]
 
 LogReplication_IsDone(replication) ==
     replication /= Null /\ replication.position >= replication.stopPosition
