@@ -1557,25 +1557,32 @@ Next ==
 
 Spec == Init /\ [][Next]_vars
 
-BoundedLog == \A n \in Nodes: Len(log[n]) <= 3
+BoundedLog == \A n \in Nodes: Len(log'[n]) <= 3
 
 MaxLeadershipTerm == 2
 
-BoundedElectionCount == \A n \in Nodes: /\ nodeStateFile_candidateTermId[n] <= MaxLeadershipTerm
-                                        /\ election_candidateTermId[n] <= MaxLeadershipTerm
-                                        /\ leadershipTermId[n] <= MaxLeadershipTerm
+BoundedElectionCount == \A n \in Nodes: /\ nodeStateFile_candidateTermId'[n] <= MaxLeadershipTerm
+                                        /\ election_candidateTermId'[n] <= MaxLeadershipTerm
+                                        /\ leadershipTermId'[n] <= MaxLeadershipTerm
 
-BoundedTimeoutCount == \A n \in Nodes: checker_timeoutCount <= 6
+MaxTimeoutCount == Cardinality(Nodes) * 2
+
+BoundedTimeoutCount == \A n \in Nodes: checker_timeoutCount' <= MaxTimeoutCount
 
 BoundedCandidacy ==
-    Cardinality({n \in Nodes: role[n] = "CANDIDATE"}) <= 2
+    Cardinality({n \in Nodes: role'[n] = "CANDIDATE"}) <= 2
+
+ArbitraryFirstLeader == CHOOSE n \in Nodes: TRUE
 
 UncontestedFirstElection ==
-    \/ \A n \in Nodes: leadershipTermId[n] >= 0 \* Might disable searching useful space when we add node restarts.
-    \/ Cardinality({n \in Nodes: role[n] = "CANDIDATE"}) <= 1
+    \A n \in Nodes:
+        \/ n = ArbitraryFirstLeader
+        \/ leadershipTermId[n] >= 0 \* This restriction might accidentally disable the search of interesting state space when we add node restarts.
+        \/ /\ leadershipTermId[n] < 0
+           /\ role'[n] \notin { "LEADER", "CANDIDATE" }
 
 \* State constraint to bound the execution for model checking
-StateConstraint ==
+ActionConstraint ==
     /\ BoundedLog
     /\ BoundedElectionCount
     /\ BoundedTimeoutCount
