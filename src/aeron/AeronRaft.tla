@@ -1353,7 +1353,9 @@ CM_ConsensusWork(n) ==
           /\ LET appendPos == Len(log[n])
                  quorumPos == CM_QuorumPositionBoundedByLeaderLog0(n, appendPos)
              IN CM_UpdateLeaderPosition(n, appendPos, quorumPos)
-       \/ /\ role[n] = "FOLLOWER"
+       \/ \* This is a deviation from the Java implementation, to allow multi-election testing with only 2 nodes,
+          \* by entering an election arbitrarily on the leader node too.
+          \* In Java: /\ role[n] = "FOLLOWER"
           /\ CM_EnterElection(n, 1)
           /\ UNCHANGED <<persistent_state, notifiedCommitPosition, leaderMember, commitPosition, leadershipTermId,
                          network>>
