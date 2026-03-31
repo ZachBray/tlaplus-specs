@@ -7,3 +7,4 @@ states
 *.html
 .idea
 *.toolbox/
+_apalache-out/
