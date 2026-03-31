@@ -38,10 +38,15 @@ VARIABLE clusterMembers_leadershipTermId
 VARIABLE clusterMembers_logPosition
 VARIABLE network
 
+\* Variables for limiting the state space search, rather than modelling the actual behaviour.
 VARIABLE checker_timeoutCount
 
-\* Variables for limiting the state space search, rather than modelling the actual behaviour.
+MaxLeadershipTerm == 2
+MaxTimeoutCount == Cardinality(Nodes) * 2
+MaxLogLength == 4
+ArbitraryFirstLeader == CHOOSE n \in Nodes : TRUE
 
+\*Symmetry == {}
 Symmetry == { p[1] @@ p[2] : p \in Permutations(Nodes) \X Permutations(Payloads) }
 
 Roles == {
@@ -204,6 +209,7 @@ ResetElectionFields(n) ==
 
 \* Models the transition to CANVASS from other states, which resets members etc.
 Election_State_CANVASS(n, timeoutCount) ==
+    /\ checker_timeoutCount + timeoutCount < MaxTimeoutCount \* STATE SPACE GUARD
     /\ election_state' = [election_state EXCEPT ![n] = "CANVASS"]
     /\ clusterMembers_isBallotSent' = [ clusterMembers_isBallotSent EXCEPT ![n] = [ m \in Nodes |-> FALSE ] ]
     /\ clusterMembers_vote' = [ clusterMembers_vote EXCEPT ![n] = [ m \in Nodes |-> Null ] ]
@@ -278,7 +284,8 @@ Election_Canvass(n) ==
 NodeStateFile_ProposeMaxCandidateTermId(n, candidateTermId, logPosition) ==
     LET newCandidateTermId == Max({candidateTermId, nodeStateFile_candidateTermId[n]})
         newLogPosition == IF candidateTermId > nodeStateFile_candidateTermId[n] THEN logPosition ELSE nodeStateFile_logPosition[n]
-    IN /\ nodeStateFile_candidateTermId' = [nodeStateFile_candidateTermId EXCEPT ![n] = newCandidateTermId ]
+    IN /\ newCandidateTermId <= MaxLeadershipTerm \* STATE SPACE GUARD
+       /\ nodeStateFile_candidateTermId' = [nodeStateFile_candidateTermId EXCEPT ![n] = newCandidateTermId ]
        /\ nodeStateFile_logPosition' = [nodeStateFile_logPosition EXCEPT ![n] = newLogPosition]
        /\ election_candidateTermId' = [election_candidateTermId EXCEPT ![n] = newCandidateTermId]
 
@@ -291,7 +298,11 @@ Election_Nominate(n) ==
     /\ election_state[n] = "NOMINATE"
     /\ \/ Election_PublishCanvassPosition(n)
        \/ LET newCandidateTermId == Max({election_candidateTermId[n] + 1, nodeStateFile_candidateTermId[n]})
-          IN /\ NodeStateFile_ProposeMaxCandidateTermId(n, newCandidateTermId, election_logPosition[n])
+          IN /\ newCandidateTermId <= MaxLeadershipTerm \* STATE SPACE GUARD
+             /\ \/ Symmetry /= {}
+                \/ n = ArbitraryFirstLeader \* STATE SPACE GUARD
+                \/ leadershipTermId[n] >= 0 \* STATE SPACE GUARD
+             /\ NodeStateFile_ProposeMaxCandidateTermId(n, newCandidateTermId, election_logPosition[n])
              /\ ClusterMember_BecomeCandidate(n, newCandidateTermId)
              /\ Election_State_CANDIDATE_BALLOT(n)
              /\ UNCHANGED <<log, recordingLog, commitPosition, leaderMember, logReplay,
@@ -549,6 +560,7 @@ Election_LeaderReady(n) ==
     /\ LET quorumPos == CM_QuorumPositionBoundedByLeaderLog1(n)
        IN \/ /\ ClusterMember_HasQuorumAtPosition(n)
              /\ CM_ElectionComplete(n)
+             /\ Len(log[n]) < MaxLogLength \* STATE SPACE GUARD
              /\ log' = [log EXCEPT ![n] = Append(@, [
                     type |-> "NewLeadershipTerm",
                     leadershipTermId |-> election_leadershipTermId[n],
@@ -631,6 +643,7 @@ Election_FollowerLogReplication(n) ==
                  sourceMember == logReplication[n].sourceMember
                  sourceLogLength == Len(log[sourceMember])
              IN /\ sourceLogLength >= newPosition
+                /\ newPosition <= MaxLogLength \* STATE SPACE GUARD
                 /\ logReplication' = [logReplication EXCEPT ![n].position = newPosition]
                 /\ log' = [log EXCEPT ![n] = Append(@, log[sourceMember][newPosition])]
                 /\ UNCHANGED <<nodeStateFile_candidateTermId, nodeStateFile_logPosition, recordingLog,
@@ -805,6 +818,7 @@ Election_FollowerCatchup(n) ==
                           ELSE Null
           IN /\ newEntry /= Null
              /\ newPosition < election_notifiedCommitPosition[n]
+             /\ newPosition <= MaxLogLength \* STATE SPACE GUARD
              /\ election_logSubscription' = [election_logSubscription EXCEPT ![n].position = newPosition]
              /\ log' = [log EXCEPT ![n] = Append(@, newEntry)]
              /\ \/ /\ newEntry.type = "NewLeadershipTerm"
@@ -1339,11 +1353,12 @@ CM_OnVote(n, msg, newNetwork) ==
           /\ UNCHANGED<<persistent_state, module_fields, election_state, election_fields, member_fields, checker_vars>>
 
 CM_AppendMsg(n) ==
-    \E value \in Payloads :
-        LET msg == [type |-> "SessionMessage", payload |-> value ]
-        IN /\ log' = [log EXCEPT ![n] = Append(@, msg)]
-           /\ UNCHANGED <<nodeStateFile_candidateTermId, nodeStateFile_logPosition, recordingLog, module_fields,
-                          election_state, election_fields, member_fields, network, checker_vars>>
+    /\ Len(log[n]) < MaxLogLength \* STATE SPACE GUARD
+    /\ \E value \in Payloads :
+            LET msg == [type |-> "SessionMessage", payload |-> value ]
+            IN /\ log' = [log EXCEPT ![n] = Append(@, msg)]
+               /\ UNCHANGED <<nodeStateFile_candidateTermId, nodeStateFile_logPosition, recordingLog, module_fields,
+                              election_state, election_fields, member_fields, network, checker_vars>>
 
 CM_ConsensusWork(n) ==
     /\ election_state[n] = "CLOSED"
@@ -1366,6 +1381,7 @@ CM_ConsensusWork(n) ==
           /\ LET newPosition == election_logSubscription[n].position + 1
                  logEntry == IF Len(log[leaderMember[n]]) >= newPosition THEN log[leaderMember[n]][newPosition] ELSE Null
              IN /\ logEntry /= Null
+                /\ newPosition <= MaxLogLength \* STATE SPACE GUARD
                 /\ log' = [log EXCEPT ![n] = Append(@, logEntry)]
                 /\ election_logSubscription' = [election_logSubscription EXCEPT ![n].position = newPosition]
                 /\ UNCHANGED <<nodeStateFile_candidateTermId, nodeStateFile_logPosition, recordingLog,
@@ -1511,42 +1527,42 @@ Next ==
         \* replicated log up to the notifiedCommitPosition, or it might enter an election on a timeout.
         \/ CM_ConsensusWork(n)
 
-    \/ \E src, dest \in Nodes:
+        \/ \E src \in Nodes \ {n}:
             \* Node receives an AppendPosition message and updates the "follower's" positions if its
             \* leadership term is less-than-or-equal-to the election's leadership term.
             \* Note that there is no LEADER check.
-            \/ Adapter_OnAppendPosition(src, dest)
+            \/ Adapter_OnAppendPosition(src, n)
 
             \* Node receives a CanvassPosition message and, if it is the leader, responds with a
             \* NewLeadershipTerm message containing the information for the next term after the
             \* message's logLeadershipTerm.
-            \/ Adapter_OnCanvassPosition(src, dest)
+            \/ Adapter_OnCanvassPosition(src, n)
 
             \* Node receives a CatchupPosition message and, if it is the leader, starts a catchup replay
             \* for the follower.
-            \/ Adapter_OnCatchupPosition(src, dest)
+            \/ Adapter_OnCatchupPosition(src, n)
 
             \* Node receives a CommitPosition message and updates its notified commit position
             \* if the message is from the currently "accepted" leader, or reverts to INIT if
             \* the message is from a new leader with a higher term.
-            \/ Adapter_OnCommitPosition(src, dest)
+            \/ Adapter_OnCommitPosition(src, n)
 
             \* Node receives a NewLeadershipTerm message and enters an election if the term is higher than
             \* its current term. If already in an election, it updates its election state with the
             \* information from the message, and may transition to INIT, CANVASS, FOLLOWER_REPLAY, or
             \* FOLLOWER_LOG_REPLICATION. It is worth noting the node may also truncate its log if the
             \* new leadership term's log position is behind the node's current append position.
-            \/ Adapter_OnNewLeadershipTerm(src, dest)
+            \/ Adapter_OnNewLeadershipTerm(src, n)
 
             \* Node receives a RequestVote message and decides whether to vote for the candidate or not
             \* depending on the candidate's candidate term and log position. Enters FOLLOWER_BALLOT if it
             \* votes for the candidate. When not in an election, receiving a RequestVote message with a
             \* higher candidate term causes the node to enter an election.
-            \/ Adapter_OnRequestVote(src, dest)
+            \/ Adapter_OnRequestVote(src, n)
 
             \* Node receives a Vote message and if in the CANDIDATE_BALLOT state and the message matches
             \* the candidate term, it updates the vote and log information for the sender of the message.
-            \/ Adapter_OnVote(src, dest)
+            \/ Adapter_OnVote(src, n)
 
 \*            \/ MessageLoss(src, dest)
             \* Perturbations to add later:
@@ -1558,38 +1574,6 @@ Next ==
             \*  - Commited entries must reside on a quorum of nodes
 
 Spec == Init /\ [][Next]_vars
-
-BoundedLog == \A n \in Nodes: Len(log'[n]) <= 3
-
-MaxLeadershipTerm == 2
-
-BoundedElectionCount == \A n \in Nodes: /\ nodeStateFile_candidateTermId'[n] <= MaxLeadershipTerm
-                                        /\ election_candidateTermId'[n] <= MaxLeadershipTerm
-                                        /\ leadershipTermId'[n] <= MaxLeadershipTerm
-
-MaxTimeoutCount == Cardinality(Nodes) * 2
-
-BoundedTimeoutCount == \A n \in Nodes: checker_timeoutCount' <= MaxTimeoutCount
-
-BoundedCandidacy ==
-    Cardinality({n \in Nodes: role'[n] = "CANDIDATE"}) <= 2
-
-ArbitraryFirstLeader == CHOOSE n \in Nodes: TRUE
-
-UncontestedFirstElection ==
-    \A n \in Nodes:
-        \/ n = ArbitraryFirstLeader
-        \/ leadershipTermId[n] >= 0 \* This restriction might accidentally disable the search of interesting state space when we add node restarts.
-        \/ /\ leadershipTermId[n] < 0
-           /\ role'[n] \notin { "LEADER", "CANDIDATE" }
-
-\* State constraint to bound the execution for model checking
-ActionConstraint ==
-    /\ BoundedLog
-    /\ BoundedElectionCount
-    /\ BoundedTimeoutCount
-    /\ BoundedCandidacy
-    /\ UncontestedFirstElection
 
 \* Type invariant to catch basic errors
 TypeInvariant ==
