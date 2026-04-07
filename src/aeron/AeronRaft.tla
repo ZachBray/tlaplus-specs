@@ -1631,4 +1631,9 @@ Debug_CompleteMultipleElections ==
                        /\ leadershipTermId[n] >= 1
                        /\ Len(SelectSeq(log[n], LAMBDA entry: entry.type = "NewLeadershipTerm")) >= 2
 
+LogConsistency ==
+    \A n1, n2 \in Nodes:
+        LET minCommitPos == Min({commitPosition[n1], commitPosition[n2]}) IN
+        SubSeq(log[n1], 1, minCommitPos) = SubSeq(log[n2], 1, minCommitPos)
+
 =============================================================================
