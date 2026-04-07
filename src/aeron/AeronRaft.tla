@@ -44,8 +44,7 @@ VARIABLE checker_timeoutCount
 
 MaxLeadershipTerm == 2
 MaxTimeoutCount == Cardinality(Nodes) * 2
-MaxLogLength == 4
-ArbitraryFirstLeader == CHOOSE n \in Nodes : TRUE
+MaxLogLength == 3
 
 Symmetry == { p[1] @@ p[2] : p \in Permutations(Nodes \ {ArbitraryFirstLeader}) \X Permutations(Payloads) }
 
@@ -212,7 +211,7 @@ ResetElectionFields(n) ==
 \* Models the transition to CANVASS from other states, which resets members etc.
 Election_State_CANVASS(n, timeoutCount) ==
     /\ \/ timeoutCount = 0
-       \/ leadershipTermId[n] > 0 \* STATE SPACE GUARD
+       \/ leadershipTermId[n] >= 0 \* STATE SPACE GUARD
     /\ checker_timeoutCount + timeoutCount < MaxTimeoutCount \* STATE SPACE GUARD
     /\ election_state' = [election_state EXCEPT ![n] = "CANVASS"]
     /\ clusterMembers_isBallotSent' = [ clusterMembers_isBallotSent EXCEPT ![n] = [ m \in Nodes |-> FALSE ] ]
@@ -536,20 +535,11 @@ ClusterMember_HasQuorumAtPosition(n) ==
     Cardinality({ m \in Nodes: /\ clusterMembers_leadershipTermId[n][m] = election_leadershipTermId[n]
                                /\ clusterMembers_logPosition[n][m] >= election_logPosition[n]}) >= QuorumSize
 
-CM_UpdateLeaderPosition(n, appendPos, quorumPos) ==
-    /\ clusterMembers_logPosition' = [clusterMembers_logPosition EXCEPT ![n][n] = appendPos]
-    /\ \/ /\ quorumPos > commitPosition[n]
-          /\ CM_PublishCommitPosition(n, quorumPos, leadershipTermId[n])
-          /\ commitPosition' = [commitPosition EXCEPT ![n] = quorumPos]
-          /\ UNCHANGED <<persistent_state, role, leaderMember, logReplay, leadershipTermId,
-                         logReplication, notifiedCommitPosition,
-                         election_state, election_fields,
-                         clusterMembers_vote, clusterMembers_candidateTermId,
-                         clusterMembers_isBallotSent, clusterMembers_leadershipTermId, checker_vars>>
-       \/ /\ quorumPos <= commitPosition[n]
-          /\ UNCHANGED <<persistent_state, module_fields, election_state, election_fields,
-                         clusterMembers_vote, clusterMembers_candidateTermId,
-                         clusterMembers_isBallotSent, clusterMembers_leadershipTermId, network, checker_vars>>
+CM_UpdateLeaderPosition(n, quorumPos) ==
+    /\ quorumPos > commitPosition[n]
+    /\ commitPosition' = [commitPosition EXCEPT ![n] = quorumPos]
+    /\ \/ CM_PublishCommitPosition(n, quorumPos, leadershipTermId[n])
+       \/ UNCHANGED<<network>>
 
 CM_ElectionComplete(n) ==
     /\ leadershipTermId' = [leadershipTermId EXCEPT ![n] = election_leadershipTermId[n]]
@@ -561,9 +551,9 @@ CM_ElectionComplete(n) ==
 Election_LeaderReady(n) ==
     /\ election_state[n] = "LEADER_READY"
     /\ LET quorumPos == CM_QuorumPositionBoundedByLeaderLog1(n)
-       IN \/ /\ ClusterMember_HasQuorumAtPosition(n)
+       IN \/ /\ Len(log[n]) < MaxLogLength \* STATE SPACE GUARD
+             /\ ClusterMember_HasQuorumAtPosition(n)
              /\ CM_ElectionComplete(n)
-             /\ Len(log[n]) < MaxLogLength \* STATE SPACE GUARD
              /\ log' = [log EXCEPT ![n] = Append(@, [
                     type |-> "NewLeadershipTerm",
                     leadershipTermId |-> election_leadershipTermId[n],
@@ -571,12 +561,19 @@ Election_LeaderReady(n) ==
                     leaderMember |-> n,
                     termBaseLogPosition |-> election_appendPosition[n]
                 ])]
+             \* The logPosition update is not in Java until consensusWork(), but helps reduce the number of states:
+             /\ clusterMembers_logPosition' = [clusterMembers_logPosition EXCEPT ![n][n] = Len(log[n]) + 1]
              /\ election_state' = [election_state EXCEPT ![n] = "CLOSED"]
              /\ UNCHANGED <<nodeStateFile_candidateTermId, nodeStateFile_logPosition, recordingLog,
                             role, election_logSubscription, clusterMembers_candidateTermId,
-                            clusterMembers_leadershipTermId, clusterMembers_logPosition,
-                            network, checker_vars>>
-          \/ CM_UpdateLeaderPosition(n, election_appendPosition[n], quorumPos)
+                            clusterMembers_leadershipTermId, network, checker_vars>>
+          \/ /\ clusterMembers_logPosition' = [clusterMembers_logPosition EXCEPT ![n][n] = election_appendPosition[n]]
+             /\ CM_UpdateLeaderPosition(n, quorumPos)
+             /\ UNCHANGED <<persistent_state, role, leaderMember, logReplay, leadershipTermId,
+                            logReplication, notifiedCommitPosition,
+                            election_state, election_fields,
+                            clusterMembers_vote, clusterMembers_candidateTermId,
+                            clusterMembers_isBallotSent, clusterMembers_leadershipTermId, checker_vars>>
           \/ /\ Election_PublishNewLeadershipTermOnInterval(n, quorumPos)
              /\ UNCHANGED <<persistent_state, module_fields, election_state, election_fields, member_fields, checker_vars>>
 
@@ -803,7 +800,10 @@ Election_FollowerCatchupAwait(n) ==
 
 CM_UpdateFollowerPosition(n, leader) ==
     LET position == Len(log[n])
-    IN /\ Send(network, [type |-> "AppendPosition",
+    IN
+       /\ \/ clusterMembers_logPosition[leader][n] < position \* Non-local information! STATE SPACE GUARD
+          \/ clusterMembers_leadershipTermId[leader][n] /= leadershipTermId[n] \* Non-local information! STATE SPACE GUARD
+       /\ Send(network, [type |-> "AppendPosition",
                          from |-> n,
                          to |-> leader,
                          leadershipTermId |-> leadershipTermId[n],
@@ -934,6 +934,8 @@ Election_FollowerReady(n) ==
                          notifiedCommitPosition, election_logLeadershipTermId, election_leadershipTermId, network>>
 
 CM_EnterElection(n, timeoutCount) ==
+    /\ Len(log[n]) < MaxLogLength \* STATE SPACE GUARD
+    /\ leadershipTermId[n] /= MaxLeadershipTerm \* STATE SPACE GUARD
     /\ election_logPosition' = [election_logPosition EXCEPT ![n] = commitPosition[n]]
     /\ election_appendPosition' = [election_appendPosition EXCEPT ![n] = Len(log[n])]
     /\ election_logLeadershipTermId' = [election_logLeadershipTermId EXCEPT ![n] = leadershipTermId[n]]
@@ -1360,8 +1362,14 @@ CM_AppendMsg(n) ==
     /\ \E value \in Payloads :
             LET msg == [type |-> "SessionMessage", payload |-> value ]
             IN /\ log' = [log EXCEPT ![n] = Append(@, msg)]
+               \* TODO: this differs from Java, in that we update the cluster members view straight away, is it reasonable?
+               \*       the aim is state space reduction
+               /\ clusterMembers_logPosition' = [clusterMembers_logPosition EXCEPT ![n][n] = Len(log[n]) + 1]
                /\ UNCHANGED <<nodeStateFile_candidateTermId, nodeStateFile_logPosition, recordingLog, module_fields,
-                              election_state, election_fields, member_fields, network, checker_vars>>
+                              election_state, election_fields,
+                              clusterMembers_vote, clusterMembers_candidateTermId,
+                              clusterMembers_isBallotSent, clusterMembers_leadershipTermId,
+                              network, checker_vars>>
 
 CM_ConsensusWork(n) ==
     /\ election_state[n] = "CLOSED"
@@ -1370,7 +1378,10 @@ CM_ConsensusWork(n) ==
        \/ /\ role[n] = "LEADER"
           /\ LET appendPos == Len(log[n])
                  quorumPos == CM_QuorumPositionBoundedByLeaderLog0(n, appendPos)
-             IN CM_UpdateLeaderPosition(n, appendPos, quorumPos)
+             IN /\ CM_UpdateLeaderPosition(n, quorumPos)
+                /\ UNCHANGED <<persistent_state, role, leaderMember, logReplay, leadershipTermId,
+                               logReplication, notifiedCommitPosition,
+                               election_state, election_fields, member_fields, checker_vars>>
        \/ \* This is a deviation from the Java implementation, to allow multi-election testing with only 2 nodes,
           \* by entering an election arbitrarily on the leader node too.
           \* In Java: /\ role[n] = "FOLLOWER"
