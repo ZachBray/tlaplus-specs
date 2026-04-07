@@ -4,6 +4,7 @@ EXTENDS Naturals, Integers, FiniteSets, Sequences, SequencesExt, TLC
 \* Based on Aeron commit 717903af0087e2c488f292e3577fb44ec1d52a01.
 
 CONSTANT Nodes
+CONSTANT ArbitraryFirstLeader
 CONSTANT Payloads
 CONSTANT Null
 
@@ -46,8 +47,7 @@ MaxTimeoutCount == Cardinality(Nodes) * 2
 MaxLogLength == 4
 ArbitraryFirstLeader == CHOOSE n \in Nodes : TRUE
 
-\*Symmetry == {}
-Symmetry == { p[1] @@ p[2] : p \in Permutations(Nodes) \X Permutations(Payloads) }
+Symmetry == { p[1] @@ p[2] : p \in Permutations(Nodes \ {ArbitraryFirstLeader}) \X Permutations(Payloads) }
 
 Roles == {
     "LEADER",
@@ -209,6 +209,8 @@ ResetElectionFields(n) ==
 
 \* Models the transition to CANVASS from other states, which resets members etc.
 Election_State_CANVASS(n, timeoutCount) ==
+    /\ \/ timeoutCount = 0
+       \/ leadershipTermId[n] > 0 \* STATE SPACE GUARD
     /\ checker_timeoutCount + timeoutCount < MaxTimeoutCount \* STATE SPACE GUARD
     /\ election_state' = [election_state EXCEPT ![n] = "CANVASS"]
     /\ clusterMembers_isBallotSent' = [ clusterMembers_isBallotSent EXCEPT ![n] = [ m \in Nodes |-> FALSE ] ]
@@ -299,8 +301,7 @@ Election_Nominate(n) ==
     /\ \/ Election_PublishCanvassPosition(n)
        \/ LET newCandidateTermId == Max({election_candidateTermId[n] + 1, nodeStateFile_candidateTermId[n]})
           IN /\ newCandidateTermId <= MaxLeadershipTerm \* STATE SPACE GUARD
-             /\ \/ Symmetry /= {}
-                \/ n = ArbitraryFirstLeader \* STATE SPACE GUARD
+             /\ \/ n = ArbitraryFirstLeader \* STATE SPACE GUARD
                 \/ leadershipTermId[n] >= 0 \* STATE SPACE GUARD
              /\ NodeStateFile_ProposeMaxCandidateTermId(n, newCandidateTermId, election_logPosition[n])
              /\ ClusterMember_BecomeCandidate(n, newCandidateTermId)
