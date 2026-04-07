@@ -49,6 +49,8 @@ ArbitraryFirstLeader == CHOOSE n \in Nodes : TRUE
 
 Symmetry == { p[1] @@ p[2] : p \in Permutations(Nodes \ {ArbitraryFirstLeader}) \X Permutations(Payloads) }
 
+NodeCount == Cardinality(Nodes)
+
 Roles == {
     "LEADER",
     "FOLLOWER",
@@ -1372,6 +1374,8 @@ CM_ConsensusWork(n) ==
        \/ \* This is a deviation from the Java implementation, to allow multi-election testing with only 2 nodes,
           \* by entering an election arbitrarily on the leader node too.
           \* In Java: /\ role[n] = "FOLLOWER"
+          /\ \/ role[n] = "FOLLOWER"
+             \/ NodeCount <= 2
           /\ CM_EnterElection(n, 1)
           /\ UNCHANGED <<persistent_state, notifiedCommitPosition, leaderMember, commitPosition, leadershipTermId,
                          network>>
