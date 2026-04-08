@@ -43,7 +43,7 @@ VARIABLE network
 VARIABLE checker_timeoutCount
 
 MaxLeadershipTerm == 2
-MaxTimeoutCount == Cardinality(Nodes) * 2
+MaxTimeoutCount == Cardinality(Nodes) * MaxLeadershipTerm * 2
 MaxLogLength == 3
 
 Symmetry == { p[1] @@ p[2] : p \in Permutations(Nodes \ {ArbitraryFirstLeader}) \X Permutations(Payloads) }
@@ -212,7 +212,7 @@ ResetElectionFields(n) ==
 Election_State_CANVASS(n, timeoutCount) ==
     /\ \/ timeoutCount = 0
        \/ leadershipTermId[n] >= 0 \* STATE SPACE GUARD
-    /\ checker_timeoutCount + timeoutCount < MaxTimeoutCount \* STATE SPACE GUARD
+    /\ checker_timeoutCount + timeoutCount <= MaxTimeoutCount \* STATE SPACE GUARD
     /\ election_state' = [election_state EXCEPT ![n] = "CANVASS"]
     /\ clusterMembers_isBallotSent' = [ clusterMembers_isBallotSent EXCEPT ![n] = [ m \in Nodes |-> FALSE ] ]
     /\ clusterMembers_vote' = [ clusterMembers_vote EXCEPT ![n] = [ m \in Nodes |-> Null ] ]
@@ -252,12 +252,14 @@ Election_HandleError(n) ==
     /\ commitPosition' = [commitPosition EXCEPT ![n] = election_logPosition[n]]
 
 Election_PublishCanvassPosition(n) ==
+    /\ checker_timeoutCount < MaxTimeoutCount \* STATE SPACE GUARD
+    /\ checker_timeoutCount' = checker_timeoutCount + 1
     /\ Broadcast(network, [from |-> n,
                            type |-> "CanvassPosition",
                            logLeadershipTermId |-> election_logLeadershipTermId[n],
                            appendPosition |-> election_appendPosition[n],
                            logPosition |-> election_logPosition[n]])
-    /\ UNCHANGED <<persistent_state, module_fields, election_state, election_fields, member_fields, checker_vars>>
+    /\ UNCHANGED <<persistent_state, module_fields, election_state, election_fields, member_fields>>
 
 ClusterMember_CompareLog0(lhsLeadershipTermId, lhsLogPosition, rhsLeadershipTermId, rhsLogPosition) ==
     IF lhsLeadershipTermId > rhsLeadershipTermId THEN 1
@@ -299,7 +301,7 @@ ClusterMember_BecomeCandidate(n, candidateTermId) ==
 
 Election_Nominate(n) ==
     /\ election_state[n] = "NOMINATE"
-    /\ \/ Election_PublishCanvassPosition(n)
+    /\ \* Omitted, as present in CANVASS already, but present in Java: \/ Election_PublishCanvassPosition(n)
        \/ LET newCandidateTermId == Max({election_candidateTermId[n] + 1, nodeStateFile_candidateTermId[n]})
           IN /\ newCandidateTermId <= MaxLeadershipTerm \* STATE SPACE GUARD
              /\ \/ n = ArbitraryFirstLeader \* STATE SPACE GUARD
@@ -410,6 +412,8 @@ CM_OnReplayNewLeadershipTermEvent(n, termId, logPosition, termBaseLogPosition) =
           /\ UNCHANGED <<recordingLog, election_logPosition, election_logLeadershipTermId, checker_vars>>
 
 Election_PublishNewLeadershipTermOnInterval(n, quorumPos) ==
+    /\ checker_timeoutCount < MaxTimeoutCount \* STATE SPACE GUARD
+    /\ checker_timeoutCount' = checker_timeoutCount + 1
     /\ LET entry == RecordingLog_FindTermEntry(n, election_leadershipTermId[n]) IN
        LET nextLeadershipTermId == IF entry = Null THEN election_leadershipTermId[n] ELSE entry.leadershipTermId + 1 IN
        LET nextTermBaseLogPosition == IF entry = Null THEN election_appendPosition[n] ELSE entry.termBaseLogPosition IN
@@ -436,7 +440,9 @@ CM_PublishCommitPosition(n, quorumPos, termId) ==
                         leaderMember |-> n ])
 
 Election_PublishCommitPositionOnInterval(n, quorumPos) ==
-    CM_PublishCommitPosition(n, quorumPos, election_leadershipTermId[n])
+    /\ checker_timeoutCount < MaxTimeoutCount \* STATE SPACE GUARD
+    /\ checker_timeoutCount' = checker_timeoutCount + 1
+    /\ CM_PublishCommitPosition(n, quorumPos, election_leadershipTermId[n])
 
 CM_QuorumPositionBoundedByLeaderLog0(n, leaderAppendPosition) ==
     Min({leaderAppendPosition, MaxQuorumPosition(n)})
@@ -456,7 +462,7 @@ Election_LeaderLogReplication(n) ==
           \/ /\ Election_PublishNewLeadershipTermOnInterval(n, quorumPos)
              /\ UNCHANGED <<persistent_state, module_fields, election_state, election_fields,
                             clusterMembers_vote, clusterMembers_candidateTermId,
-                            clusterMembers_isBallotSent, clusterMembers_leadershipTermId, checker_vars>>
+                            clusterMembers_isBallotSent, clusterMembers_leadershipTermId>>
           \/ /\ Election_PublishCommitPositionOnInterval(n, quorumPos)
              /\ UNCHANGED <<persistent_state, module_fields, election_state,
                             election_logPosition, election_appendPosition,
@@ -467,7 +473,7 @@ Election_LeaderLogReplication(n) ==
                             election_replicationLeadershipTermId, election_replicationStopPosition,
                             election_replicationTermBaseLogPosition,
                             clusterMembers_vote, clusterMembers_candidateTermId,
-                            clusterMembers_isBallotSent, clusterMembers_leadershipTermId, checker_vars>>
+                            clusterMembers_isBallotSent, clusterMembers_leadershipTermId>>
 
 Election_LeaderReplay(n) ==
     /\ election_state[n] = "LEADER_REPLAY"
@@ -502,7 +508,7 @@ Election_LeaderReplay(n) ==
                          election_replicationTermBaseLogPosition,
                          member_fields, network, checker_vars>>
        \/ /\ Election_PublishNewLeadershipTermOnInterval(n, CM_QuorumPositionBoundedByLeaderLog1(n))
-          /\ UNCHANGED <<persistent_state, module_fields, election_state, election_fields, member_fields, checker_vars>>
+          /\ UNCHANGED <<persistent_state, module_fields, election_state, election_fields, member_fields>>
        \/ /\ Election_PublishCommitPositionOnInterval(n, CM_QuorumPositionBoundedByLeaderLog1(n))
           /\ UNCHANGED <<persistent_state, module_fields, election_state,
                          election_logPosition, election_appendPosition,
@@ -512,7 +518,7 @@ Election_LeaderReplay(n) ==
                          election_catchupJoinPosition, election_logSubscription,
                          election_replicationLeadershipTermId, election_replicationStopPosition,
                          election_replicationTermBaseLogPosition,
-                         member_fields, checker_vars>>
+                         member_fields>>
 
 Election_LeaderInit(n) ==
     /\ election_state[n] = "LEADER_INIT"
@@ -538,8 +544,9 @@ ClusterMember_HasQuorumAtPosition(n) ==
 CM_UpdateLeaderPosition(n, quorumPos) ==
     /\ quorumPos > commitPosition[n]
     /\ commitPosition' = [commitPosition EXCEPT ![n] = quorumPos]
-    /\ \/ CM_PublishCommitPosition(n, quorumPos, leadershipTermId[n])
-       \/ UNCHANGED<<network>>
+    /\ CM_PublishCommitPosition(n, quorumPos, leadershipTermId[n])
+    \* TODO: doesn't account for changing commit position independently of publishing, is that reasonable?
+    \*       the aim being to reduce state space
 
 CM_ElectionComplete(n) ==
     /\ leadershipTermId' = [leadershipTermId EXCEPT ![n] = election_leadershipTermId[n]]
@@ -575,9 +582,11 @@ Election_LeaderReady(n) ==
                             clusterMembers_vote, clusterMembers_candidateTermId,
                             clusterMembers_isBallotSent, clusterMembers_leadershipTermId, checker_vars>>
           \/ /\ Election_PublishNewLeadershipTermOnInterval(n, quorumPos)
-             /\ UNCHANGED <<persistent_state, module_fields, election_state, election_fields, member_fields, checker_vars>>
+             /\ UNCHANGED <<persistent_state, module_fields, election_state, election_fields, member_fields>>
 
 Election_PublishFollowerReplicationPosition(n) ==
+    /\ \/ clusterMembers_logPosition[election_leaderMember[n]][n] < election_appendPosition[n] \* Non-local information! STATE SPACE GUARD
+       \/ clusterMembers_leadershipTermId[election_leaderMember[n]][n] < election_replicationLeadershipTermId[n] \* Non-local information! STATE SPACE GUARD
     /\ Send(network, [type |-> "AppendPosition",
                       from |-> n,
                       to |-> election_leaderMember[n],
@@ -595,6 +604,8 @@ Election_PublishFollowerReplicationPosition(n) ==
                    member_fields, checker_vars>>
 
 Election_PublishFollowerAppendPosition(n) ==
+    /\ \/ clusterMembers_logPosition[election_leaderMember[n]][n] < election_appendPosition[n] \* Non-local information! STATE SPACE GUARD
+       \/ clusterMembers_leadershipTermId[election_leaderMember[n]][n] < election_leadershipTermId[n] \* Non-local information! STATE SPACE GUARD
     /\ Send(network, [type |-> "AppendPosition",
                       from |-> n,
                       to |-> election_leaderMember[n],
@@ -1460,9 +1471,11 @@ Adapter_OnVote(src, dest) ==
     /\ CM_OnVote(dest, network[src, dest], ConsumeMessage(src, dest))
 
 MessageLoss(src, dest) ==
+    /\ checker_timeoutCount < MaxTimeoutCount
+    /\ checker_timeoutCount' = checker_timeoutCount + 1
     /\ network[src, dest] /= Null
     /\ network' = [network EXCEPT ![src, dest] = Null]
-    /\ UNCHANGED <<persistent_state, module_fields, election_state, election_fields, member_fields, checker_vars>>
+    /\ UNCHANGED <<persistent_state, module_fields, election_state, election_fields, member_fields>>
 
 Next ==
     \/ \E n \in Nodes :
